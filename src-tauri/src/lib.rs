@@ -9,6 +9,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             remote::start_agent,
             remote::stop_agent,
+            remote::get_pending_connection_request,
             remote::answer_connection_request
         ])
         .run(tauri::generate_context!())

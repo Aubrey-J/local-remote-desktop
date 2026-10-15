@@ -160,6 +160,28 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isTauri() || !agentRunning) return;
+    let cancelled = false;
+    const pollPendingRequest = () => {
+      void invoke<ConnectionRequest | null>("get_pending_connection_request")
+        .then((request) => {
+          if (!cancelled) setPendingRequest(request);
+        })
+        .catch((cause: unknown) => {
+          if (cancelled) return;
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setAgentStatus(`无法查询待批准的连接：${detail}`);
+        });
+    };
+    pollPendingRequest();
+    const timer = window.setInterval(pollPendingRequest, 750);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [agentRunning]);
+
   useEffect(() => () => {
     connectionRef.current?.close();
     if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);

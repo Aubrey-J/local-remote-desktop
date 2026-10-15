@@ -38,6 +38,7 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct RemoteState {
     server: Mutex<Option<JoinHandle<()>>>,
     pending_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
+    pending_request: Mutex<Option<ConnectionRequest>>,
     active_connection: AtomicBool,
     stopping: AtomicBool,
 }
@@ -50,7 +51,7 @@ struct ServerState {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectionRequest {
+pub struct ConnectionRequest {
     request_id: String,
     peer_address: String,
     controller_name: String,
@@ -161,7 +162,23 @@ pub fn stop_agent(remote: tauri::State<'_, Arc<RemoteState>>) -> Result<(), Stri
     {
         let _ = approval.send(false);
     }
+    remote
+        .pending_request
+        .lock()
+        .map_err(|_| "连接请求状态不可用".to_string())?
+        .take();
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_pending_connection_request(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+) -> Result<Option<ConnectionRequest>, String> {
+    remote
+        .pending_request
+        .lock()
+        .map(|request| request.clone())
+        .map_err(|_| "连接请求状态不可用".to_string())
 }
 
 #[tauri::command]
@@ -176,6 +193,11 @@ pub fn answer_connection_request(
         .map_err(|_| "连接授权状态不可用".to_string())?;
     match pending.take() {
         Some((pending_id, sender)) if pending_id == request_id => {
+            remote
+                .pending_request
+                .lock()
+                .map_err(|_| "连接请求状态不可用".to_string())?
+                .take();
             let _ = sender.send(approved);
             Ok(())
         }
@@ -272,6 +294,17 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         peer_address: peer.to_string(),
         controller_name: controller_name.clone(),
     };
+    match state.remote.pending_request.lock() {
+        Ok(mut pending) => *pending = Some(request.clone()),
+        Err(_) => {
+            clear_pending(&state.remote, &request_id);
+            state
+                .remote
+                .active_connection
+                .store(false, Ordering::Release);
+            return;
+        }
+    }
     if state
         .app
         .emit("remote-connection-request", request)
@@ -524,6 +557,14 @@ fn clear_pending(remote: &RemoteState, request_id: &str) {
     if let Ok(mut pending) = remote.pending_approval.lock() {
         if pending.as_ref().is_some_and(|(id, _)| id == request_id) {
             pending.take();
+        }
+        if let Ok(mut pending) = remote.pending_request.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|request| request.request_id == request_id)
+            {
+                pending.take();
+            }
         }
     }
 }
