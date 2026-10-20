@@ -9,13 +9,13 @@ Lantern is a LAN-first desktop application for viewing and controlling another c
 3. On the controller, add that private LAN address (for example, `192.168.1.24:4200`) and choose **连接控制**.
 4. Approve the incoming request on the controlled computer. Only then does Lantern start sending the primary screen and accept mouse/keyboard events.
 
-The preview sends JPEG screen frames over a direct WebSocket connection at up to 10 frames per second, capped at 1920 pixels wide. It accepts IPv4 LAN addresses and captures the primary screen; multi-monitor selection, IPv6, hardware video encoding, adaptive quality, audio, clipboard, discovery, accounts, file transfer, and Internet/relay connectivity are not implemented. Mouse movement, buttons, wheel scrolling, common shortcuts, and function keys are forwarded. This is an initial functional path, not yet a low-latency production streaming codec.
+Screen video is sent over a direct WebRTC media connection, with adaptive bitrate and a 1920-pixel maximum width at 30 fps. Keyboard and mouse input use a WebRTC data channel; the WebSocket on TCP port `4200` is retained for approval and connection signaling. The app prefers H.264 when the platform encoder is available and otherwise falls back to WebRTC's software codec. The live view reports the active codec/encoder and whether the encoder reports hardware acceleration. The initial hardware-encoding path uses VideoToolbox on macOS; Windows and Linux currently use software fallback. Multi-monitor selection, audio, clipboard, discovery, accounts, file transfer, and Internet/relay connectivity are not implemented.
 
-Connections are limited to loopback, private, and link-local IP addresses; the controlled computer also requires local approval for each connection. The WebSocket stream is not encrypted or authenticated, so use it only on a trusted LAN. Do not expose port 4200 to the Internet. Disconnecting releases held keys and mouse buttons.
+Connections are limited to loopback, private, and link-local IP addresses; the controlled computer also requires local approval for each connection. WebRTC encrypts media and control traffic between peers. The initial signaling handshake is LAN-only and has no account authentication, so use it only on a trusted network and do not expose port `4200` to the Internet. Allow TCP port `4200` and UDP ports `4201–4210` through the local firewall on the controlled computer. Disconnecting releases held keys and mouse buttons.
 
 ### Operating-system permissions and limitations
 
-- **macOS:** grant Lantern Screen Recording and Accessibility permissions in System Settings. Depending on the OS version, restart Lantern after changing permissions.
+- **macOS 13 or later:** required by the bundled WebRTC engine. Grant Lantern Screen Recording and Accessibility permissions in System Settings. Depending on the OS version, restart Lantern after changing permissions.
 - **Windows:** standard desktop capture and input are supported by the underlying libraries; the secure desktop/UAC prompt cannot be controlled.
 - **Linux:** screen capture and input depend on the display server and desktop-session permissions. Wayland support varies by compositor and may require an X11 session.
 

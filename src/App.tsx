@@ -89,9 +89,13 @@ function App() {
   const [error, setError] = useState("");
   const hasMounted = useRef(false);
   const connectionRef = useRef<WebSocket | null>(null);
-  const frameUrlRef = useRef<string | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const controlChannelRef = useRef<RTCDataChannel | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const lastPointerMove = useRef(0);
   const viewerRef = useRef<HTMLDivElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentAddress, setAgentAddress] = useState("");
   const [agentStatus, setAgentStatus] = useState("");
@@ -99,7 +103,7 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<RemoteStatus>("idle");
   const [connectionDeviceId, setConnectionDeviceId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState("");
-  const [frameUrl, setFrameUrl] = useState<string | null>(null);
+  const [encoderStatus, setEncoderStatus] = useState("");
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
@@ -184,8 +188,20 @@ function App() {
 
   useEffect(() => () => {
     connectionRef.current?.close();
-    if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
+    controlChannelRef.current?.close();
+    peerConnectionRef.current?.close();
   }, []);
+
+  useEffect(() => {
+    const video = remoteVideoRef.current;
+    const stream = remoteStreamRef.current;
+    if (video && stream && video.srcObject !== stream) {
+      video.srcObject = stream;
+      void video.play().catch(() => {
+        setConnectionError("无法播放远程视频流，请检查应用的媒体权限。");
+      });
+    }
+  }, [connectionStatus]);
 
   const activeDevice = useMemo(
     () => devices.find((device) => device.id === activeId) ?? null,
@@ -286,6 +302,7 @@ function App() {
     setConnectionDeviceId(device.id);
     setConnectionStatus("connecting");
     setConnectionError("");
+    setEncoderStatus("");
 
     try {
       const endpoint = new URL(`http://${device.address}`);
@@ -297,53 +314,89 @@ function App() {
 
       const socket = new WebSocket(endpoint);
       connectionRef.current = socket;
-      socket.binaryType = "arraybuffer";
       socket.onopen = () => {
         setConnectionStatus("waitingApproval");
         socket.send(JSON.stringify({ type: "hello", device_name: "Lantern 控制端" }));
       };
-      socket.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
-        if (typeof event.data === "string") {
-          try {
-            const message = JSON.parse(event.data) as {
-              type?: string;
-              message?: string;
-              screenWidth?: number;
-              screenHeight?: number;
-            };
-            if (message.type === "connected") {
-              setConnectionStatus("connected");
-              setScreenSize({
-                width: message.screenWidth ?? 0,
-                height: message.screenHeight ?? 0,
-              });
-              window.setTimeout(() => viewerRef.current?.focus(), 0);
-            } else if (message.type === "error") {
-              setConnectionStatus("error");
-              setConnectionError(message.message ?? "远程端返回错误。");
-              socket.close();
-            }
-          } catch {
-            setConnectionStatus("error");
-            setConnectionError("无法解析远程端的连接响应。");
-          }
+      socket.onmessage = (event: MessageEvent<string>) => {
+        let message: {
+          type?: string;
+          message?: string;
+          status?: string;
+          sdp?: string;
+          candidate?: string;
+          sdpMid?: string | null;
+          sdpMLineIndex?: number | null;
+        };
+        try {
+          message = JSON.parse(event.data) as typeof message;
+        } catch {
+          setConnectionStatus("error");
+          setConnectionError("无法解析远程端的信令响应。");
+          socket.close();
           return;
         }
 
-        const nextUrl = URL.createObjectURL(new Blob([event.data], { type: "image/jpeg" }));
-        if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-        frameUrlRef.current = nextUrl;
-        setFrameUrl(nextUrl);
+        if (message.type === "approved") {
+          setConnectionStatus("connecting");
+          void startWebRtcConnection(socket);
+        } else if (message.type === "answer" && message.sdp) {
+          const peer = peerConnectionRef.current;
+          if (!peer) return;
+          void peer.setRemoteDescription({ type: "answer", sdp: message.sdp })
+            .then(async () => {
+              const candidates = pendingRemoteCandidatesRef.current.splice(0);
+              await Promise.all(candidates.map((candidate) => peer.addIceCandidate(candidate)));
+            })
+            .catch((cause: unknown) => {
+              const detail = cause instanceof Error ? cause.message : String(cause);
+              setConnectionStatus("error");
+              setConnectionError(`无法协商 WebRTC 媒体连接：${detail}`);
+            });
+        } else if (message.type === "ice_candidate" && message.candidate) {
+          const candidate: RTCIceCandidateInit = {
+            candidate: message.candidate,
+            sdpMid: message.sdpMid,
+            sdpMLineIndex: message.sdpMLineIndex,
+          };
+          const peer = peerConnectionRef.current;
+          if (!peer) return;
+          if (peer.remoteDescription) {
+            void peer.addIceCandidate(candidate).catch((cause: unknown) => {
+              const detail = cause instanceof Error ? cause.message : String(cause);
+              setConnectionStatus("error");
+              setConnectionError(`无法添加 WebRTC 网络候选：${detail}`);
+            });
+          } else {
+            pendingRemoteCandidatesRef.current.push(candidate);
+          }
+        } else if (message.type === "connected") {
+          setConnectionStatus("connected");
+          window.setTimeout(() => viewerRef.current?.focus(), 0);
+        } else if (message.type === "encoder_status" && message.status) {
+          setEncoderStatus(message.status);
+        } else if (message.type === "error") {
+          setConnectionStatus("error");
+          setConnectionError(message.message ?? "远程端返回错误。");
+          socket.close();
+        } else if (message.type === "closed") {
+          setConnectionStatus("idle");
+          socket.close();
+        }
       };
       socket.onerror = () => {
         setConnectionStatus("error");
-        setConnectionError("连接失败。请确认对端已启动、地址正确，且局域网未阻止此端口。");
+        setConnectionError("连接失败。请确认对端已启动、地址正确，且局域网未阻止 TCP 4200。");
       };
       socket.onclose = () => {
         connectionRef.current = null;
-        if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-        frameUrlRef.current = null;
-        setFrameUrl(null);
+        controlChannelRef.current?.close();
+        controlChannelRef.current = null;
+        peerConnectionRef.current?.close();
+        peerConnectionRef.current = null;
+        remoteStreamRef.current = null;
+        pendingRemoteCandidatesRef.current = [];
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setScreenSize({ width: 0, height: 0 });
         setConnectionStatus((status) => status === "error" ? status : "idle");
         setConnectionDeviceId((id) => id === device.id ? null : id);
@@ -355,6 +408,79 @@ function App() {
     }
   }
 
+  async function startWebRtcConnection(socket: WebSocket) {
+    const peer = new RTCPeerConnection({ iceServers: [] });
+    peerConnectionRef.current = peer;
+    peer.addTransceiver("video", { direction: "recvonly" });
+
+    const controlChannel = peer.createDataChannel("control");
+    controlChannelRef.current = controlChannel;
+    controlChannel.onopen = () => {
+      if (peer.connectionState === "connected") setConnectionStatus("connected");
+    };
+    controlChannel.onerror = () => {
+      setConnectionError("WebRTC 键鼠控制通道发生错误。");
+    };
+
+    let offerSent = false;
+    const earlyCandidates: RTCIceCandidate[] = [];
+    const sendCandidate = (candidate: RTCIceCandidate) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          type: "ice_candidate",
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid,
+          sdpMLineIndex: candidate.sdpMLineIndex,
+        }));
+      }
+    };
+    peer.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      if (offerSent) sendCandidate(event.candidate);
+      else earlyCandidates.push(event.candidate);
+    };
+    peer.ontrack = (event) => {
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
+      remoteStreamRef.current = stream;
+      const video = remoteVideoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        void video.play().catch((cause: unknown) => {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setConnectionError(`无法播放远程视频流：${detail}`);
+        });
+      }
+    };
+    peer.onconnectionstatechange = () => {
+      if (peer.connectionState === "connected") {
+        setConnectionStatus("connected");
+        window.setTimeout(() => viewerRef.current?.focus(), 0);
+      } else if (peer.connectionState === "failed") {
+        setConnectionStatus("error");
+        setConnectionError("WebRTC 媒体连接失败。请检查两台设备间的 UDP 防火墙设置。");
+      } else if (peer.connectionState === "disconnected") {
+        setConnectionStatus("error");
+        setConnectionError("WebRTC 媒体连接中断。请检查局域网和 UDP 防火墙设置。");
+      }
+    };
+
+    try {
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      if (socket.readyState !== WebSocket.OPEN || !peer.localDescription?.sdp) {
+        throw new Error("信令连接已关闭或本地 SDP 为空。");
+      }
+      socket.send(JSON.stringify({ type: "offer", sdp: peer.localDescription.sdp }));
+      offerSent = true;
+      earlyCandidates.forEach(sendCandidate);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setConnectionStatus("error");
+      setConnectionError(`无法启动 WebRTC 连接：${detail}`);
+      socket.close();
+    }
+  }
+
   function disconnectFromDevice() {
     const socket = connectionRef.current;
     connectionRef.current = null;
@@ -362,18 +488,23 @@ function App() {
       socket.onclose = null;
       socket.close();
     }
-    if (frameUrlRef.current) URL.revokeObjectURL(frameUrlRef.current);
-    frameUrlRef.current = null;
-    setFrameUrl(null);
+    controlChannelRef.current?.close();
+    controlChannelRef.current = null;
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+    remoteStreamRef.current = null;
+    pendingRemoteCandidatesRef.current = [];
+    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setConnectionDeviceId(null);
     setConnectionStatus("idle");
     setScreenSize({ width: 0, height: 0 });
+    setEncoderStatus("");
   }
 
   function sendInput(message: Record<string, string | number | boolean>) {
-    const socket = connectionRef.current;
-    if (socket?.readyState === WebSocket.OPEN && socket.bufferedAmount < 512_000) {
-      socket.send(JSON.stringify(message));
+    const channel = controlChannelRef.current;
+    if (channel?.readyState === "open" && channel.bufferedAmount < 512_000) {
+      channel.send(JSON.stringify(message));
     }
   }
 
@@ -617,9 +748,21 @@ function App() {
                         sendInput({ type: "mouse_scroll", delta_y: event.deltaY * scale });
                       }}
                     >
-                      {frameUrl && <img alt={`${device.name} 屏幕画面`} draggable={false} src={frameUrl} />}
-                      {!frameUrl && <span className="preview-badge">正在接收屏幕画面…</span>}
-                      <span className="remote-live"><span className="lan-status-dot" />实时画面 · 点击画面后键鼠可控</span>
+                      <video
+                        autoPlay
+                        className="remote-video"
+                        muted
+                        playsInline
+                        ref={remoteVideoRef}
+                        onLoadedMetadata={(event) => setScreenSize({
+                          width: event.currentTarget.videoWidth,
+                          height: event.currentTarget.videoHeight,
+                        })}
+                      />
+                      <span className="remote-live">
+                        <span className="lan-status-dot" />
+                        WebRTC · {encoderStatus || "编码器检测中"} · 点击后键鼠可控
+                      </span>
                     </div>
                   ) : (
                     <button

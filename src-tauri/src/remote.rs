@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -18,27 +19,34 @@ use axum::{
     routing::get,
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use image::{ExtendedColorType, RgbImage, imageops::FilterType};
+use image::imageops::FilterType;
+use reactor_webrtc::{
+    IceCandidate, MediaKind, PeerConnection, PeerConnectionFactory, PeerConnectionObserver,
+    PeerConnectionState, RtcConfiguration, SdpType, SessionDescription, StreamKind, VideoCodec,
+    VideoFrame,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::{
     net::TcpListener,
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::{interval, timeout},
+    time::timeout,
 };
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 4200;
 const MAX_FRAME_WIDTH: u32 = 1920;
-const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const SIGNALING_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Default)]
 pub struct RemoteState {
     server: Mutex<Option<JoinHandle<()>>>,
     pending_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
     pending_request: Mutex<Option<ConnectionRequest>>,
+    webrtc_factory: Mutex<Option<Arc<PeerConnectionFactory>>>,
     active_connection: AtomicBool,
     stopping: AtomicBool,
 }
@@ -47,6 +55,7 @@ pub struct RemoteState {
 struct ServerState {
     app: AppHandle,
     remote: Arc<RemoteState>,
+    webrtc_factory: Arc<PeerConnectionFactory>,
 }
 
 #[derive(Clone, Serialize)]
@@ -62,6 +71,16 @@ pub struct ConnectionRequest {
 enum ClientMessage {
     Hello {
         device_name: String,
+    },
+    Offer {
+        sdp: String,
+    },
+    IceCandidate {
+        candidate: String,
+        #[serde(rename = "sdpMid")]
+        sdp_mid: Option<String>,
+        #[serde(rename = "sdpMLineIndex")]
+        sdp_mline_index: Option<u16>,
     },
     MouseMove {
         x: f64,
@@ -104,6 +123,29 @@ pub async fn start_agent(
         return Err("正在关闭上一条控制连接，请稍后重试".to_string());
     }
 
+    let existing_factory = remote
+        .webrtc_factory
+        .lock()
+        .map_err(|_| "WebRTC 状态不可用".to_string())?
+        .clone();
+    let webrtc_factory = if let Some(factory) = existing_factory {
+        factory
+    } else {
+        let factory = tokio::task::spawn_blocking(|| {
+            PeerConnectionFactory::builder()
+                .build()
+                .map(Arc::new)
+                .map_err(|error| format!("无法初始化 WebRTC：{error}"))
+        })
+        .await
+        .map_err(|error| format!("WebRTC 初始化任务失败：{error}"))??;
+        let mut stored_factory = remote
+            .webrtc_factory
+            .lock()
+            .map_err(|_| "WebRTC 状态不可用".to_string())?;
+        Arc::clone(stored_factory.get_or_insert(factory))
+    };
+
     let port = port.unwrap_or(DEFAULT_PORT);
     let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port)))
         .await
@@ -114,6 +156,7 @@ pub async fn start_agent(
     let state = ServerState {
         app: app.clone(),
         remote: Arc::clone(&remote),
+        webrtc_factory,
     };
     remote.stopping.store(false, Ordering::Release);
     let app_for_status = app.clone();
@@ -217,8 +260,8 @@ async fn websocket_upgrade(
     if !is_lan_address(peer.ip()) {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.max_message_size(16 * 1024)
-        .max_frame_size(16 * 1024)
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
         .on_upgrade(move |socket| handle_connection(socket, peer, state))
         .into_response()
 }
@@ -356,48 +399,199 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         return;
     }
 
-    let (width, height) = match tokio::task::spawn_blocking(capture_dimensions).await {
-        Ok(Ok(dimensions)) => dimensions,
-        Ok(Err(error)) => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": error})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            state
-                .remote
-                .active_connection
-                .store(false, Ordering::Release);
-            return;
-        }
+    if send_signal(&mut socket, serde_json::json!({"type": "approved"}))
+        .await
+        .is_err()
+    {
+        state
+            .remote
+            .active_connection
+            .store(false, Ordering::Release);
+        return;
+    }
+
+    let session_error = match run_webrtc_session(&mut socket, &state).await {
+        Ok(()) => None,
         Err(error) => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": error.to_string()})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            state
-                .remote
-                .active_connection
-                .store(false, Ordering::Release);
-            return;
+            let _ = send_signal(
+                &mut socket,
+                serde_json::json!({"type": "error", "message": error}),
+            )
+            .await;
+            let _ = socket.send(Message::Close(None)).await;
+            Some(error)
         }
     };
 
-    let metadata = serde_json::json!({
-        "type": "connected",
-        "controllerName": controller_name,
-        "screenWidth": width,
-        "screenHeight": height,
-    });
+    state
+        .remote
+        .active_connection
+        .store(false, Ordering::Release);
+    let _ = state.app.emit(
+        "agent-status",
+        session_error.unwrap_or_else(|| "控制端已断开".to_string()),
+    );
+}
+
+enum WebRtcSignal {
+    Candidate(IceCandidate),
+    State(PeerConnectionState),
+    CaptureError(String),
+    EncoderStatus {
+        codec: Option<String>,
+        encoder: Option<String>,
+        hardware: Option<bool>,
+    },
+}
+
+struct StatsWorker {
+    stopping: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StatsWorker {
+    fn new() -> Self {
+        Self {
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+
+    fn start(
+        &mut self,
+        peer_connection: Arc<PeerConnection>,
+        signals: mpsc::UnboundedSender<WebRtcSignal>,
+    ) {
+        if self.thread.is_some() {
+            return;
+        }
+        let stopping = Arc::clone(&self.stopping);
+        self.thread = Some(thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(1));
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Ok(stats) = peer_connection.get_stats()
+                    && let Some(video) = stats
+                        .outbound_rtp
+                        .iter()
+                        .find(|stream| stream.kind == StreamKind::Video)
+                {
+                    let _ = signals.send(WebRtcSignal::EncoderStatus {
+                        codec: video.codec_mime_type.clone(),
+                        encoder: video.encoder_implementation.clone(),
+                        hardware: video.power_efficient_encoder,
+                    });
+                }
+            }
+        }));
+    }
+}
+
+impl Drop for StatsWorker {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct CaptureWorker {
+    stopping: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CaptureWorker {
+    fn new() -> Self {
+        Self {
+            stopping: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+
+    fn start(
+        &mut self,
+        track: Arc<reactor_webrtc::VideoTrack>,
+        signals: mpsc::UnboundedSender<WebRtcSignal>,
+    ) {
+        if self.thread.is_some() {
+            return;
+        }
+        let stopping = Arc::clone(&self.stopping);
+        self.thread = Some(thread::spawn(move || {
+            while !stopping.load(Ordering::Acquire) {
+                let started = std::time::Instant::now();
+                match capture_bgra() {
+                    Ok((frame, frame_width, frame_height)) => {
+                        if let Err(error) =
+                            track.push_frame(VideoFrame::new(&frame, frame_width, frame_height))
+                        {
+                            let _ = signals.send(WebRtcSignal::CaptureError(error.to_string()));
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = signals.send(WebRtcSignal::CaptureError(error));
+                        break;
+                    }
+                }
+                thread::sleep(FRAME_INTERVAL.saturating_sub(started.elapsed()));
+            }
+        }));
+    }
+}
+
+impl Drop for CaptureWorker {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Result<(), String> {
+    let offer = match timeout(SIGNALING_TIMEOUT, async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => {
+                    return match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::Offer { sdp }) => Ok(SessionDescription {
+                            kind: SdpType::Offer,
+                            sdp,
+                        }),
+                        _ => Err("等待控制端 WebRTC offer 时收到无效消息".to_string()),
+                    };
+                }
+                Some(Ok(Message::Ping(payload))) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(|error| format!("WebSocket 错误：{error}"))?,
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err("控制端在建立 WebRTC 连接前已断开".to_string());
+                }
+                Some(Err(error)) => return Err(format!("WebSocket 错误：{error}")),
+                Some(Ok(_)) => return Err("等待控制端 WebRTC offer 时收到无效消息".to_string()),
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err("等待控制端 WebRTC offer 超时".to_string()),
+    };
+
+    let (width, height) = tokio::task::spawn_blocking(capture_dimensions)
+        .await
+        .map_err(|error| format!("屏幕尺寸读取任务失败：{error}"))??;
     let (input_sender, input_receiver) = std::sync::mpsc::channel::<ClientMessage>();
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
-    let (input_error_sender, mut input_error_receiver) = tokio::sync::mpsc::channel(1);
-    std::thread::spawn(move || {
+    let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel::<WebRtcSignal>();
+    let (input_error_sender, mut input_error_receiver) = mpsc::unbounded_channel::<String>();
+
+    thread::spawn(move || {
         let mut enigo = match Enigo::new(&Settings::default()) {
             Ok(enigo) => {
                 let _ = ready_sender.send(Ok(()));
@@ -421,7 +615,7 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
                 &mut pressed_buttons,
                 &mut scroll_remainder,
             ) {
-                let _ = input_error_sender.blocking_send(error);
+                let _ = input_error_sender.send(error);
                 break;
             }
         }
@@ -432,125 +626,211 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
             let _ = enigo.button(button, Direction::Release);
         }
     });
+
     match ready_receiver.recv() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({
-                        "type": "error",
-                        "message": format!("无法启用键鼠控制：{error}，请检查系统辅助功能权限。")
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await;
-            state
-                .remote
-                .active_connection
-                .store(false, Ordering::Release);
-            return;
+            return Err(format!(
+                "无法启用键鼠控制：{error}，请检查被控端的辅助功能权限。"
+            ));
         }
-        Err(error) => {
-            let _ = socket
-                .send(Message::Text(
-                    serde_json::json!({"type": "error", "message": error.to_string()})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            state
-                .remote
-                .active_connection
-                .store(false, Ordering::Release);
-            return;
-        }
-    }
-    if socket
-        .send(Message::Text(metadata.to_string().into()))
-        .await
-        .is_err()
-    {
-        state
-            .remote
-            .active_connection
-            .store(false, Ordering::Release);
-        return;
+        Err(error) => return Err(format!("键鼠控制服务启动失败：{error}")),
     }
 
-    let mut frame_clock = interval(FRAME_INTERVAL);
-    frame_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let input_for_channel = input_sender.clone();
+    let signals_for_peer = signal_sender.clone();
+    let signals_for_state = signal_sender.clone();
+    let observer = PeerConnectionObserver::new()
+        .on_ice_candidate(move |candidate| {
+            let _ = signals_for_peer.send(WebRtcSignal::Candidate(candidate));
+        })
+        .on_connection_state_change(move |connection_state| {
+            let _ = signals_for_state.send(WebRtcSignal::State(connection_state));
+        })
+        .on_data_channel(move |channel| {
+            let input_for_this_channel = input_for_channel.clone();
+            channel.on_message(move |data, binary| {
+                if binary {
+                    return;
+                }
+                if let Ok(text) = std::str::from_utf8(data)
+                    && let Ok(command) = serde_json::from_str::<ClientMessage>(text)
+                    && is_input_message(&command)
+                {
+                    let _ = input_for_this_channel.send(command);
+                }
+            });
+        });
+
+    let rtc_configuration = RtcConfiguration {
+        min_port: Some(4201),
+        max_port: Some(4210),
+        ..RtcConfiguration::default()
+    };
+    let peer_connection = Arc::new(
+        state
+            .webrtc_factory
+            .create_peer_connection(&rtc_configuration, observer)
+            .map_err(|error| format!("无法建立 WebRTC 连接：{error}"))?,
+    );
+    peer_connection
+        .set_bitrate(None, Some(4_000_000), Some(12_000_000))
+        .map_err(|error| format!("无法配置 WebRTC 视频码率：{error}"))?;
+    peer_connection
+        .set_remote_description(&offer)
+        .map_err(|error| format!("无法读取控制端 WebRTC offer：{error}"))?;
+
+    let video_track = Arc::new(
+        state
+            .webrtc_factory
+            .create_video_track("lantern-screen")
+            .map_err(|error| format!("无法创建屏幕视频轨道：{error}"))?,
+    );
+    peer_connection
+        .add_track(&video_track)
+        .map_err(|error| format!("无法添加屏幕视频轨道：{error}"))?;
+    for transceiver in peer_connection.transceivers() {
+        if transceiver.kind() == MediaKind::Video {
+            transceiver
+                .set_codec_preferences(&[VideoCodec::H264, VideoCodec::Vp8])
+                .map_err(|error| format!("无法配置 WebRTC 视频编码格式：{error}"))?;
+        }
+    }
+    let answer = peer_connection
+        .create_answer()
+        .map_err(|error| format!("无法创建 WebRTC answer：{error}"))?;
+    peer_connection
+        .set_local_description(&answer)
+        .map_err(|error| format!("无法应用 WebRTC answer：{error}"))?;
+    send_signal(
+        socket,
+        serde_json::json!({"type": "answer", "sdp": answer.sdp}),
+    )
+    .await
+    .map_err(|error| format!("无法发送 WebRTC answer：{error}"))?;
+
+    let mut capture_worker = CaptureWorker::new();
+    let mut stats_worker = StatsWorker::new();
+
     loop {
         tokio::select! {
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let command = match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(command) => command,
-                            Err(_) => {
-                                let _ = socket.send(Message::Text(
-                                    serde_json::json!({"type": "error", "message": "无效的控制指令"}).to_string().into()
-                                )).await;
-                                break;
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
+                                peer_connection
+                                    .add_ice_candidate(&IceCandidate {
+                                        candidate,
+                                        sdp_mid,
+                                        sdp_mline_index,
+                                    })
+                                    .map_err(|error| format!("无法添加控制端 ICE candidate：{error}"))?;
                             }
-                        };
-                        if matches!(&command, ClientMessage::Hello { .. }) {
-                            continue;
-                        }
-                        if input_sender.send(command).is_err() {
-                            let _ = socket.send(Message::Text(
-                                serde_json::json!({"type": "error", "message": "键鼠控制服务已停止"}).to_string().into()
-                            )).await;
-                            break;
+                            Ok(ClientMessage::Offer { .. }) => {
+                                return Err("控制端重复发送 WebRTC offer".to_string());
+                            }
+                            _ => return Err("信令通道收到无效消息".to_string()),
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(error)) => return Err(format!("WebSocket 错误：{error}")),
                     Some(Ok(Message::Ping(payload))) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
-                            break;
-                        }
+                        socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| format!("WebSocket 错误：{error}"))?;
                     }
                     Some(Ok(_)) => {}
                 }
             }
-            _ = frame_clock.tick() => {
-                if state.remote.stopping.load(Ordering::Acquire) {
-                    let _ = socket.send(Message::Close(None)).await;
-                    break;
-                }
-                match tokio::task::spawn_blocking(capture_jpeg).await {
-                    Ok(Ok(frame)) => {
-                        if socket.send(Message::Binary(frame.into())).await.is_err() {
-                            break;
-                        }
+            signal = signal_receiver.recv() => {
+                match signal {
+                    Some(WebRtcSignal::Candidate(candidate)) => {
+                        send_signal(socket, serde_json::json!({
+                            "type": "ice_candidate",
+                            "candidate": candidate.candidate,
+                            "sdpMid": candidate.sdp_mid,
+                            "sdpMLineIndex": candidate.sdp_mline_index,
+                        }))
+                        .await
+                        .map_err(|error| format!("发送 ICE candidate 失败：{error}"))?;
                     }
-                    Ok(Err(error)) => {
-                        let _ = socket.send(Message::Text(
-                            serde_json::json!({"type": "error", "message": error}).to_string().into()
-                        )).await;
-                        break;
+                    Some(WebRtcSignal::State(PeerConnectionState::Connected)) => {
+                        send_signal(socket, serde_json::json!({"type": "connected"}))
+                            .await
+                            .map_err(|error| format!("发送连接状态失败：{error}"))?;
+                        capture_worker.start(Arc::clone(&video_track), signal_sender.clone());
+                        stats_worker.start(Arc::clone(&peer_connection), signal_sender.clone());
                     }
-                    Err(error) => {
-                        let _ = state.app.emit("agent-status", format!("屏幕采集失败：{error}"));
-                        break;
+                    Some(WebRtcSignal::State(PeerConnectionState::Failed | PeerConnectionState::Closed)) => {
+                        return Err("WebRTC 媒体连接已失败或关闭".to_string());
                     }
+                    Some(WebRtcSignal::State(PeerConnectionState::Disconnected)) => {
+                        return Err("WebRTC 连接中断，请检查局域网和防火墙 UDP 设置。".to_string());
+                    }
+                    Some(WebRtcSignal::State(_)) => {}
+                    Some(WebRtcSignal::CaptureError(error)) => {
+                        return Err(format!("屏幕采集或视频编码失败：{error}"));
+                    }
+                    Some(WebRtcSignal::EncoderStatus { codec, encoder, hardware }) => {
+                        let acceleration = match hardware {
+                            Some(true) => "硬件加速",
+                            Some(false) => "软件编码",
+                            None => "加速状态未知",
+                        };
+                        let description = format!(
+                            "{} · {} · {}",
+                            codec.as_deref().unwrap_or("视频编码"),
+                            encoder.as_deref().unwrap_or("编码器检测中"),
+                            acceleration,
+                        );
+                        send_signal(
+                            socket,
+                            serde_json::json!({
+                                "type": "encoder_status",
+                                "status": description,
+                            }),
+                        )
+                        .await
+                        .map_err(|error| format!("发送编码器状态失败：{error}"))?;
+                    }
+                    None => return Err("WebRTC 信令通道已关闭".to_string()),
                 }
             }
             Some(error) = input_error_receiver.recv() => {
-                let message = format!("键鼠控制失败：{error}，请检查被控端的辅助功能权限。");
-                let _ = state.app.emit("agent-status", message.clone());
-                let _ = socket.send(Message::Text(
-                    serde_json::json!({"type": "error", "message": message}).to_string().into()
-                )).await;
+                return Err(format!("键鼠控制失败：{error}，请检查被控端的辅助功能权限。"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)), if state.remote.stopping.load(Ordering::Acquire) => {
+                let _ = send_signal(socket, serde_json::json!({"type": "closed"})).await;
                 break;
             }
         }
     }
-    state
-        .remote
-        .active_connection
-        .store(false, Ordering::Release);
-    let _ = state.app.emit("agent-status", "控制端已断开".to_string());
+
+    drop(stats_worker);
+    drop(capture_worker);
+    drop(input_sender);
+    drop(peer_connection);
+    Ok(())
+}
+
+async fn send_signal(
+    socket: &mut WebSocket,
+    message: serde_json::Value,
+) -> Result<(), axum::Error> {
+    socket.send(Message::Text(message.to_string().into())).await
+}
+
+fn is_input_message(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::MouseMove { .. }
+            | ClientMessage::MouseButton { .. }
+            | ClientMessage::MouseScroll { .. }
+            | ClientMessage::Key { .. }
+            | ClientMessage::ReleaseAll
+    )
 }
 
 fn clear_pending(remote: &RemoteState, request_id: &str) {
@@ -594,7 +874,7 @@ fn capture_dimensions() -> Result<(u32, u32), String> {
     Ok((screen.display_info.width, screen.display_info.height))
 }
 
-fn capture_jpeg() -> Result<Vec<u8>, String> {
+fn capture_bgra() -> Result<(Vec<u8>, u32, u32), String> {
     let screen = primary_screen()?;
     let screenshot = screen
         .capture()
@@ -614,17 +894,11 @@ fn capture_jpeg() -> Result<Vec<u8>, String> {
     } else {
         image::imageops::resize(&pixels, frame_width, frame_height, FilterType::Triangle)
     };
-    let rgb: RgbImage = image::DynamicImage::ImageRgba8(resized).to_rgb8();
-    let mut output = Vec::with_capacity((frame_width * frame_height) as usize / 2);
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 65)
-        .encode(
-            rgb.as_raw(),
-            frame_width,
-            frame_height,
-            ExtendedColorType::Rgb8,
-        )
-        .map_err(|error| format!("屏幕图像编码失败：{error}"))?;
-    Ok(output)
+    let mut output = resized.into_raw();
+    for pixel in output.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok((output, frame_width, frame_height))
 }
 
 fn primary_screen() -> Result<screenshots::Screen, String> {
@@ -711,6 +985,7 @@ fn apply_input(
         }
         ClientMessage::MouseMove { .. } => {}
         ClientMessage::MouseScroll { .. } => {}
+        ClientMessage::Offer { .. } | ClientMessage::IceCandidate { .. } => {}
     }
     Ok(())
 }
@@ -795,6 +1070,24 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn webrtc_signaling_messages_accept_browser_payloads() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(r#"{"type":"offer","sdp":"v=0"}"#),
+            Ok(ClientMessage::Offer { sdp }) if sdp == "v=0"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"ice_candidate","candidate":"candidate:1","sdpMid":"0","sdpMLineIndex":0}"#
+            ),
+            Ok(ClientMessage::IceCandidate { candidate, sdp_mid: Some(mid), sdp_mline_index: Some(0) })
+                if candidate == "candidate:1" && mid == "0"
+        ));
+        assert!(!is_input_message(
+            &serde_json::from_str::<ClientMessage>(r#"{"type":"offer","sdp":"v=0"}"#).unwrap()
+        ));
     }
 
     #[test]
