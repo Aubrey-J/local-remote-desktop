@@ -590,6 +590,8 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
     let (signal_sender, mut signal_receiver) = mpsc::unbounded_channel::<WebRtcSignal>();
     let (input_error_sender, mut input_error_receiver) = mpsc::unbounded_channel::<String>();
+    let channel_error_sender = input_error_sender.clone();
+    let data_channels = Arc::new(Mutex::new(Vec::new()));
 
     thread::spawn(move || {
         let mut enigo = match Enigo::new(&Settings::default()) {
@@ -638,6 +640,7 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
     }
 
     let input_for_channel = input_sender.clone();
+    let channels_for_peer = Arc::clone(&data_channels);
     let signals_for_peer = signal_sender.clone();
     let signals_for_state = signal_sender.clone();
     let observer = PeerConnectionObserver::new()
@@ -660,6 +663,12 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
                     let _ = input_for_this_channel.send(command);
                 }
             });
+            match channels_for_peer.lock() {
+                Ok(mut channels) => channels.push(channel),
+                Err(_) => {
+                    let _ = channel_error_sender.send("WebRTC 键鼠控制通道状态不可用".to_string());
+                }
+            }
         });
 
     let rtc_configuration = RtcConfiguration {
@@ -811,6 +820,7 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
     drop(stats_worker);
     drop(capture_worker);
     drop(input_sender);
+    drop(data_channels);
     drop(peer_connection);
     Ok(())
 }
