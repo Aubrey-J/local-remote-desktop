@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-22.04
+          - runner: ubuntu-24.04
             artifact: lantern-linux
             bundles: deb,appimage
           - runner: windows-latest
@@ -38,8 +38,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 23
           sudo apt-get install --yes \
             build-essential \
+            clang-23 \
             curl \
             file \
             libfuse2 \
@@ -55,6 +59,10 @@ jobs:
             librsvg2-dev \
             libxkbcommon-dev \
             libwayland-dev
+
+      - name: Select Linux C++ compiler
+        if: runner.os == 'Linux'
+        run: echo "CXX=clang++-23" >> "$GITHUB_ENV"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -72,6 +80,14 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Configure macOS WebRTC runtime
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          runtime_archive="$(xcrun clang --print-resource-dir)/lib/darwin/libclang_rt.osx.a"
+          test -f "$runtime_archive"
+          echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=-C link-arg=$runtime_archive" >> "$GITHUB_ENV"
 
       - name: Build and bundle Lantern
         run: npm run tauri -- build --bundles ${{ matrix.bundles }}
