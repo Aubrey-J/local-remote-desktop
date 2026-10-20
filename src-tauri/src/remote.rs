@@ -604,28 +604,22 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
                 return;
             }
         };
-        let mut pressed_keys = HashSet::new();
-        let mut pressed_buttons = HashSet::new();
-        let mut scroll_remainder = 0.0;
+        let mut input_state = InputState::default();
         for command in input_receiver {
-            if let Err(error) = apply_input(
-                &mut enigo,
-                command,
-                width,
-                height,
-                &mut pressed_keys,
-                &mut pressed_buttons,
-                &mut scroll_remainder,
-            ) {
+            if let Err(error) = apply_input(&mut enigo, command, width, height, &mut input_state) {
                 let _ = input_error_sender.send(error);
                 break;
             }
         }
-        for key in pressed_keys {
+        for key in input_state.pressed_keys {
             let _ = enigo.key(key, Direction::Release);
         }
-        for button in pressed_buttons {
+        for button in input_state.pressed_buttons {
             let _ = enigo.button(button, Direction::Release);
+        }
+        #[cfg(target_os = "windows")]
+        for scancode in input_state.pressed_scancodes {
+            let _ = enigo.raw(scancode, Direction::Release);
         }
     });
 
@@ -921,14 +915,21 @@ fn primary_screen() -> Result<screenshots::Screen, String> {
         .ok_or_else(|| "没有找到可采集的屏幕".to_string())
 }
 
+#[derive(Default)]
+struct InputState {
+    pressed_keys: HashSet<Key>,
+    pressed_buttons: HashSet<Button>,
+    #[cfg(target_os = "windows")]
+    pressed_scancodes: HashSet<u16>,
+    scroll_remainder: f64,
+}
+
 fn apply_input(
     enigo: &mut Enigo,
     message: ClientMessage,
     width: u32,
     height: u32,
-    pressed_keys: &mut HashSet<Key>,
-    pressed_buttons: &mut HashSet<Button>,
-    scroll_remainder: &mut f64,
+    state: &mut InputState,
 ) -> Result<(), String> {
     match message {
         ClientMessage::MouseMove { x, y } if x.is_finite() && y.is_finite() => {
@@ -946,10 +947,10 @@ fn apply_input(
                 _ => return Ok(()),
             };
             let direction = if down {
-                pressed_buttons.insert(button);
+                state.pressed_buttons.insert(button);
                 Direction::Press
             } else {
-                pressed_buttons.remove(&button);
+                state.pressed_buttons.remove(&button);
                 Direction::Release
             };
             enigo
@@ -957,12 +958,26 @@ fn apply_input(
                 .map_err(|error| error.to_string())?;
         }
         ClientMessage::Key { code, key, down } => {
-            if let Some(key) = translate_key(&code, &key) {
+            #[cfg(target_os = "windows")]
+            if let Some(scancode) = physical_scancode(&code) {
                 let direction = if down {
-                    pressed_keys.insert(key);
+                    state.pressed_scancodes.insert(scancode);
                     Direction::Press
                 } else {
-                    pressed_keys.remove(&key);
+                    state.pressed_scancodes.remove(&scancode);
+                    Direction::Release
+                };
+                enigo
+                    .raw(scancode, direction)
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            if let Some(key) = translate_key(&code, &key) {
+                let direction = if down {
+                    state.pressed_keys.insert(key);
+                    Direction::Press
+                } else {
+                    state.pressed_keys.remove(&key);
                     Direction::Release
                 };
                 enigo
@@ -971,10 +986,10 @@ fn apply_input(
             }
         }
         ClientMessage::MouseScroll { delta_y } if delta_y.is_finite() => {
-            *scroll_remainder += delta_y;
-            let steps = (*scroll_remainder / 100.0).trunc() as i32;
+            state.scroll_remainder += delta_y;
+            let steps = (state.scroll_remainder / 100.0).trunc() as i32;
             if steps != 0 {
-                *scroll_remainder -= steps as f64 * 100.0;
+                state.scroll_remainder -= steps as f64 * 100.0;
                 enigo
                     .scroll(steps, Axis::Vertical)
                     .map_err(|error| error.to_string())?;
@@ -982,14 +997,20 @@ fn apply_input(
         }
         ClientMessage::Hello { .. } => {}
         ClientMessage::ReleaseAll => {
-            for key in pressed_keys.drain() {
+            for key in state.pressed_keys.drain() {
                 enigo
                     .key(key, Direction::Release)
                     .map_err(|error| error.to_string())?;
             }
-            for button in pressed_buttons.drain() {
+            for button in state.pressed_buttons.drain() {
                 enigo
                     .button(button, Direction::Release)
+                    .map_err(|error| error.to_string())?;
+            }
+            #[cfg(target_os = "windows")]
+            for scancode in state.pressed_scancodes.drain() {
+                enigo
+                    .raw(scancode, Direction::Release)
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -1015,9 +1036,6 @@ fn translate_key(code: &str, key: &str) -> Option<Key> {
         "ShiftLeft" | "ShiftRight" => Some(Key::Shift),
         "ControlLeft" | "ControlRight" => Some(Key::Control),
         "AltLeft" | "AltRight" => Some(Key::Alt),
-        #[cfg(target_os = "windows")]
-        "MetaLeft" | "MetaRight" => Some(Key::Control),
-        #[cfg(not(target_os = "windows"))]
         "MetaLeft" | "MetaRight" => Some(Key::Meta),
         "Home" => Some(Key::Home),
         "End" => Some(Key::End),
@@ -1046,8 +1064,6 @@ fn translate_key(code: &str, key: &str) -> Option<Key> {
         "F20" => Some(Key::F20),
         _ => None,
     };
-    #[cfg(target_os = "windows")]
-    let special = windows_physical_key(code).or(special);
     special.or_else(|| {
         let mut characters = key.chars();
         let character = characters.next()?;
@@ -1055,59 +1071,113 @@ fn translate_key(code: &str, key: &str) -> Option<Key> {
     })
 }
 
-#[cfg(target_os = "windows")]
-fn windows_physical_key(code: &str) -> Option<Key> {
-    let key = match code {
-        "KeyA" => Key::A,
-        "KeyB" => Key::B,
-        "KeyC" => Key::C,
-        "KeyD" => Key::D,
-        "KeyE" => Key::E,
-        "KeyF" => Key::F,
-        "KeyG" => Key::G,
-        "KeyH" => Key::H,
-        "KeyI" => Key::I,
-        "KeyJ" => Key::J,
-        "KeyK" => Key::K,
-        "KeyL" => Key::L,
-        "KeyM" => Key::M,
-        "KeyN" => Key::N,
-        "KeyO" => Key::O,
-        "KeyP" => Key::P,
-        "KeyQ" => Key::Q,
-        "KeyR" => Key::R,
-        "KeyS" => Key::S,
-        "KeyT" => Key::T,
-        "KeyU" => Key::U,
-        "KeyV" => Key::V,
-        "KeyW" => Key::W,
-        "KeyX" => Key::X,
-        "KeyY" => Key::Y,
-        "KeyZ" => Key::Z,
-        "Digit0" => Key::Num0,
-        "Digit1" => Key::Num1,
-        "Digit2" => Key::Num2,
-        "Digit3" => Key::Num3,
-        "Digit4" => Key::Num4,
-        "Digit5" => Key::Num5,
-        "Digit6" => Key::Num6,
-        "Digit7" => Key::Num7,
-        "Digit8" => Key::Num8,
-        "Digit9" => Key::Num9,
-        "Minus" => Key::OEMMinus,
-        "Equal" => Key::OEMPlus,
-        "BracketLeft" => Key::OEM4,
-        "BracketRight" => Key::OEM6,
-        "Backslash" => Key::OEM5,
-        "Semicolon" => Key::OEM1,
-        "Quote" => Key::OEM7,
-        "Backquote" => Key::OEM3,
-        "Comma" => Key::OEMComma,
-        "Period" => Key::OEMPeriod,
-        "Slash" => Key::OEM2,
+#[cfg(any(target_os = "windows", test))]
+fn physical_scancode(code: &str) -> Option<u16> {
+    Some(match code {
+        "KeyA" => 0x1e,
+        "KeyB" => 0x30,
+        "KeyC" => 0x2e,
+        "KeyD" => 0x20,
+        "KeyE" => 0x12,
+        "KeyF" => 0x21,
+        "KeyG" => 0x22,
+        "KeyH" => 0x23,
+        "KeyI" => 0x17,
+        "KeyJ" => 0x24,
+        "KeyK" => 0x25,
+        "KeyL" => 0x26,
+        "KeyM" => 0x32,
+        "KeyN" => 0x31,
+        "KeyO" => 0x18,
+        "KeyP" => 0x19,
+        "KeyQ" => 0x10,
+        "KeyR" => 0x13,
+        "KeyS" => 0x1f,
+        "KeyT" => 0x14,
+        "KeyU" => 0x16,
+        "KeyV" => 0x2f,
+        "KeyW" => 0x11,
+        "KeyX" => 0x2d,
+        "KeyY" => 0x15,
+        "KeyZ" => 0x2c,
+        "Digit1" => 0x02,
+        "Digit2" => 0x03,
+        "Digit3" => 0x04,
+        "Digit4" => 0x05,
+        "Digit5" => 0x06,
+        "Digit6" => 0x07,
+        "Digit7" => 0x08,
+        "Digit8" => 0x09,
+        "Digit9" => 0x0a,
+        "Digit0" => 0x0b,
+        "Minus" => 0x0c,
+        "Equal" => 0x0d,
+        "BracketLeft" => 0x1a,
+        "BracketRight" => 0x1b,
+        "Backslash" => 0x2b,
+        "IntlBackslash" => 0x56,
+        "Semicolon" => 0x27,
+        "Quote" => 0x28,
+        "Backquote" => 0x29,
+        "Comma" => 0x33,
+        "Period" => 0x34,
+        "Slash" => 0x35,
+        "ShiftLeft" => 0x2a,
+        "ShiftRight" => 0x36,
+        "ControlLeft" | "MetaLeft" => 0x1d,
+        "ControlRight" | "MetaRight" => 0xe01d,
+        "AltLeft" => 0x38,
+        "AltRight" => 0xe038,
+        "Enter" => 0x1c,
+        "NumpadEnter" => 0xe01c,
+        "Escape" => 0x01,
+        "Backspace" => 0x0e,
+        "Tab" => 0x0f,
+        "Space" => 0x39,
+        "CapsLock" => 0x3a,
+        "F1" => 0x3b,
+        "F2" => 0x3c,
+        "F3" => 0x3d,
+        "F4" => 0x3e,
+        "F5" => 0x3f,
+        "F6" => 0x40,
+        "F7" => 0x41,
+        "F8" => 0x42,
+        "F9" => 0x43,
+        "F10" => 0x44,
+        "F11" => 0x57,
+        "F12" => 0x58,
+        "PrintScreen" => 0xe037,
+        "ScrollLock" => 0x46,
+        "Pause" => 0x45,
+        "Insert" => 0xe052,
+        "Home" => 0xe047,
+        "PageUp" => 0xe049,
+        "Delete" => 0xe053,
+        "End" => 0xe04f,
+        "PageDown" => 0xe051,
+        "ArrowUp" => 0xe048,
+        "ArrowLeft" => 0xe04b,
+        "ArrowDown" => 0xe050,
+        "ArrowRight" => 0xe04d,
+        "NumLock" => 0xe045,
+        "NumpadDivide" => 0xe035,
+        "NumpadMultiply" => 0x37,
+        "NumpadSubtract" => 0x4a,
+        "NumpadAdd" => 0x4e,
+        "NumpadDecimal" => 0x53,
+        "Numpad0" => 0x52,
+        "Numpad1" => 0x4f,
+        "Numpad2" => 0x50,
+        "Numpad3" => 0x51,
+        "Numpad4" => 0x4b,
+        "Numpad5" => 0x4c,
+        "Numpad6" => 0x4d,
+        "Numpad7" => 0x47,
+        "Numpad8" => 0x48,
+        "Numpad9" => 0x49,
         _ => return None,
-    };
-    Some(key)
+    })
 }
 
 #[cfg(test)]
@@ -1169,11 +1239,14 @@ mod tests {
         assert_eq!(translate_key("UnmappedKey", "ab"), None);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn windows_shortcuts_use_physical_keys_and_map_command_to_control() {
-        assert_eq!(translate_key("MetaLeft", "Meta"), Some(Key::Control));
-        assert_eq!(translate_key("KeyC", "c"), Some(Key::C));
-        assert_eq!(translate_key("Digit5", "5"), Some(Key::Num5));
+    fn physical_scancodes_cover_shortcuts_and_shifted_punctuation() {
+        assert_eq!(physical_scancode("MetaLeft"), Some(0x1d));
+        assert_eq!(physical_scancode("ControlRight"), Some(0xe01d));
+        assert_eq!(physical_scancode("KeyC"), Some(0x2e));
+        assert_eq!(physical_scancode("Digit5"), Some(0x06));
+        assert_eq!(physical_scancode("ShiftLeft"), Some(0x2a));
+        assert_eq!(physical_scancode("Semicolon"), Some(0x27));
+        assert_eq!(physical_scancode("UnmappedKey"), None);
     }
 }

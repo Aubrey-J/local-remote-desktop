@@ -7,7 +7,7 @@ Lantern is a LAN-first desktop application for viewing and controlling another c
 1. Build and launch Lantern on both computers with `npm install` and `npm run tauri dev`, or install a desktop bundle.
 2. On the computer to be controlled, select **启动被控端**. Lantern listens on TCP port `4200` and displays the LAN address it detects.
 3. On the controller, add that private LAN address (for example, `192.168.1.24:4200`) and choose **连接控制**.
-4. Approve the incoming request on the controlled computer. Only then does Lantern start sending the primary screen and accept mouse/keyboard events. Focus the remote screen to type; on a Mac controller, Command shortcuts are mapped to Control shortcuts on a Windows controlled computer. Use the expand button in the remote view to enter fullscreen, and press Escape or the button again to leave fullscreen.
+4. Approve the incoming request on the controlled computer. Only then does Lantern start sending the primary screen and accept mouse/keyboard events. Focus the remote screen to type; on a Mac controller, Command shortcuts are mapped to Control shortcuts on a Windows controlled computer. Windows receives physical key transitions for standard US-layout alphanumeric, punctuation, modifier, navigation, function, and numpad keys, so chords such as Shift+; produce the shifted key on the controlled computer's active keyboard layout. Use the expand button in the remote view to enter fullscreen, and press Escape or the button again to leave fullscreen.
 
 Added devices can be removed from the three-dot menu on their card; removal requires a second confirmation.
 
