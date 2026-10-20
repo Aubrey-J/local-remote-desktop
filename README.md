@@ -7,7 +7,9 @@ Lantern is a LAN-first desktop application for viewing and controlling another c
 1. Build and launch Lantern on both computers with `npm install` and `npm run tauri dev`, or install a desktop bundle.
 2. On the computer to be controlled, select **启动被控端**. Lantern listens on TCP port `4200` and displays the LAN address it detects.
 3. On the controller, add that private LAN address (for example, `192.168.1.24:4200`) and choose **连接控制**.
-4. Approve the incoming request on the controlled computer. Only then does Lantern start sending the primary screen and accept mouse/keyboard events.
+4. Approve the incoming request on the controlled computer. Only then does Lantern start sending the primary screen and accept mouse/keyboard events. Focus the remote screen to type; on a Mac controller, Command shortcuts are mapped to Control shortcuts on a Windows controlled computer. Use the expand button in the remote view to enter fullscreen, and press Escape or the button again to leave fullscreen.
+
+Added devices can be removed from the three-dot menu on their card; removal requires a second confirmation.
 
 Screen video is sent over a direct WebRTC media connection, with adaptive bitrate and a 1920-pixel maximum width at 30 fps. Keyboard and mouse input use a WebRTC data channel; the WebSocket on TCP port `4200` is retained for approval and connection signaling. The app prefers H.264 when the platform encoder is available and otherwise falls back to WebRTC's software codec. The live view reports the active codec/encoder and whether the encoder reports hardware acceleration. The initial hardware-encoding path uses VideoToolbox on macOS; Windows and Linux currently use software fallback. Multi-monitor selection, audio, clipboard, discovery, accounts, file transfer, and Internet/relay connectivity are not implemented.
 

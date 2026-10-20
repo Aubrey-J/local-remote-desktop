@@ -84,6 +84,8 @@ function App() {
   const [storageError, setStorageError] = useState(savedState.error);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [openDeviceMenuId, setOpenDeviceMenuId] = useState<string | null>(null);
+  const [pendingRemoval, setPendingRemoval] = useState<Device | null>(null);
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [error, setError] = useState("");
@@ -105,6 +107,7 @@ function App() {
   const [connectionError, setConnectionError] = useState("");
   const [encoderStatus, setEncoderStatus] = useState("");
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 });
+  const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
 
   useEffect(() => {
     if (!hasMounted.current) {
@@ -193,6 +196,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const updateFullscreenState = () => {
+      setIsRemoteFullscreen(document.fullscreenElement === viewerRef.current);
+    };
+    document.addEventListener("fullscreenchange", updateFullscreenState);
+    return () => document.removeEventListener("fullscreenchange", updateFullscreenState);
+  }, []);
+
+  useEffect(() => {
     const video = remoteVideoRef.current;
     const stream = remoteStreamRef.current;
     if (video && stream && video.srcObject !== stream) {
@@ -245,6 +256,21 @@ function App() {
       disconnectFromDevice();
     }
     setActiveId((current) => (current === id ? null : current));
+  }
+
+  async function toggleRemoteFullscreen() {
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+    try {
+      if (document.fullscreenElement === viewer) {
+        await document.exitFullscreen();
+      } else {
+        await viewer.requestFullscreen();
+      }
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setConnectionError(`无法切换全屏显示：${detail}`);
+    }
   }
 
   async function startAgent() {
@@ -763,6 +789,25 @@ function App() {
                         <span className="lan-status-dot" />
                         WebRTC · {encoderStatus || "编码器检测中"} · 点击后键鼠可控
                       </span>
+                      <div
+                        className="remote-toolbar"
+                        onMouseMove={(event) => event.stopPropagation()}
+                        onMouseUp={(event) => event.stopPropagation()}
+                      >
+                        <button
+                          className="icon-button remote-toolbar-button"
+                          type="button"
+                          aria-label={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
+                          title={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={() => void toggleRemoteFullscreen()}
+                        >
+                          <Icon name={isRemoteFullscreen ? "minimize" : "maximize"} />
+                        </button>
+                      </div>
                     </div>
                   ) : (
                     <button
@@ -810,15 +855,42 @@ function App() {
                         连接控制
                       </button>
                     )}
-                    <button
-                      className="icon-button card-menu"
-                      type="button"
-                      aria-label={`移除 ${device.name}`}
-                      title="从列表移除"
-                      onClick={() => removeDevice(device.id)}
+                    <div
+                      className="device-menu-wrap"
+                      onBlur={(event) => {
+                        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                          setOpenDeviceMenuId(null);
+                        }
+                      }}
                     >
-                      <Icon name="dots" />
-                    </button>
+                      <button
+                        className="icon-button card-menu"
+                        type="button"
+                        aria-label={`${device.name} 的更多操作`}
+                        title="更多操作"
+                        aria-haspopup="menu"
+                        aria-expanded={openDeviceMenuId === device.id}
+                        onClick={() => setOpenDeviceMenuId((current) =>
+                          current === device.id ? null : device.id,
+                        )}
+                      >
+                        <Icon name="dots" />
+                      </button>
+                      {openDeviceMenuId === device.id && (
+                        <div className="device-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setOpenDeviceMenuId(null);
+                              setPendingRemoval(device);
+                            }}
+                          >
+                            移除设备…
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </article>
               ))}
@@ -921,6 +993,37 @@ function App() {
           </section>
         </div>
       )}
+      {pendingRemoval && (
+        <div className="modal-backdrop">
+          <section className="device-dialog approval-dialog" aria-labelledby="remove-device-title">
+            <span className="dialog-icon"><Icon name="info" /></span>
+            <h2 id="remove-device-title">移除已添加的设备？</h2>
+            <p>
+              将从本机设备列表中移除“{pendingRemoval.name}”（{pendingRemoval.address}）。
+              此操作不会影响远程电脑。
+            </p>
+            <div className="dialog-actions">
+              <button
+                className="secondary-button"
+                onClick={() => setPendingRemoval(null)}
+                type="button"
+              >
+                取消
+              </button>
+              <button
+                className="danger-button"
+                onClick={() => {
+                  removeDevice(pendingRemoval.id);
+                  setPendingRemoval(null);
+                }}
+                type="button"
+              >
+                确认移除
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -948,6 +1051,8 @@ function Icon({ name }: { name: string }) {
     shield: <><path d="M12 3 19 6v5c0 4.5-3 7.5-7 10-4-2.5-7-5.5-7-10V6l7-3Z" /><path d="m9 12 2 2 4-4" /></>,
     check: <path d="m5 12 4 4L19 6" />,
     close: <><path d="m18 6-12 12M6 6l12 12" /></>,
+    maximize: <><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4" /></>,
+    minimize: <><path d="M8 4v4H4m12-4v4h4M4 16h4v4m12-4h-4v4" /></>,
   };
 
   return (

@@ -1015,6 +1015,9 @@ fn translate_key(code: &str, key: &str) -> Option<Key> {
         "ShiftLeft" | "ShiftRight" => Some(Key::Shift),
         "ControlLeft" | "ControlRight" => Some(Key::Control),
         "AltLeft" | "AltRight" => Some(Key::Alt),
+        #[cfg(target_os = "windows")]
+        "MetaLeft" | "MetaRight" => Some(Key::Control),
+        #[cfg(not(target_os = "windows"))]
         "MetaLeft" | "MetaRight" => Some(Key::Meta),
         "Home" => Some(Key::Home),
         "End" => Some(Key::End),
@@ -1043,11 +1046,68 @@ fn translate_key(code: &str, key: &str) -> Option<Key> {
         "F20" => Some(Key::F20),
         _ => None,
     };
+    #[cfg(target_os = "windows")]
+    let special = windows_physical_key(code).or(special);
     special.or_else(|| {
         let mut characters = key.chars();
         let character = characters.next()?;
         (characters.next().is_none() && !character.is_control()).then_some(Key::Unicode(character))
     })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_physical_key(code: &str) -> Option<Key> {
+    let key = match code {
+        "KeyA" => Key::A,
+        "KeyB" => Key::B,
+        "KeyC" => Key::C,
+        "KeyD" => Key::D,
+        "KeyE" => Key::E,
+        "KeyF" => Key::F,
+        "KeyG" => Key::G,
+        "KeyH" => Key::H,
+        "KeyI" => Key::I,
+        "KeyJ" => Key::J,
+        "KeyK" => Key::K,
+        "KeyL" => Key::L,
+        "KeyM" => Key::M,
+        "KeyN" => Key::N,
+        "KeyO" => Key::O,
+        "KeyP" => Key::P,
+        "KeyQ" => Key::Q,
+        "KeyR" => Key::R,
+        "KeyS" => Key::S,
+        "KeyT" => Key::T,
+        "KeyU" => Key::U,
+        "KeyV" => Key::V,
+        "KeyW" => Key::W,
+        "KeyX" => Key::X,
+        "KeyY" => Key::Y,
+        "KeyZ" => Key::Z,
+        "Digit0" => Key::Num0,
+        "Digit1" => Key::Num1,
+        "Digit2" => Key::Num2,
+        "Digit3" => Key::Num3,
+        "Digit4" => Key::Num4,
+        "Digit5" => Key::Num5,
+        "Digit6" => Key::Num6,
+        "Digit7" => Key::Num7,
+        "Digit8" => Key::Num8,
+        "Digit9" => Key::Num9,
+        "Minus" => Key::OEMMinus,
+        "Equal" => Key::OEMPlus,
+        "BracketLeft" => Key::OEM4,
+        "BracketRight" => Key::OEM6,
+        "Backslash" => Key::OEM5,
+        "Semicolon" => Key::OEM1,
+        "Quote" => Key::OEM7,
+        "Backquote" => Key::OEM3,
+        "Comma" => Key::OEMComma,
+        "Period" => Key::OEMPeriod,
+        "Slash" => Key::OEM2,
+        _ => return None,
+    };
+    Some(key)
 }
 
 #[cfg(test)]
@@ -1103,8 +1163,17 @@ mod tests {
     #[test]
     fn keyboard_translation_limits_input_to_keys() {
         assert_eq!(translate_key("Enter", "Enter"), Some(Key::Return));
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(translate_key("KeyA", "a"), Some(Key::Unicode('a')));
         assert_eq!(translate_key("F5", "F5"), Some(Key::F5));
-        assert_eq!(translate_key("KeyA", "ab"), None);
+        assert_eq!(translate_key("UnmappedKey", "ab"), None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_shortcuts_use_physical_keys_and_map_command_to_control() {
+        assert_eq!(translate_key("MetaLeft", "Meta"), Some(Key::Control));
+        assert_eq!(translate_key("KeyC", "c"), Some(Key::C));
+        assert_eq!(translate_key("Digit5", "5"), Some(Key::Num5));
     }
 }
