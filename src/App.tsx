@@ -15,9 +15,39 @@ type ConnectionRequest = {
   controllerName: string;
 };
 
+type VideoQuality = "quality" | "balanced" | "smooth";
+
+type LocalDeviceInfo = {
+  name: string;
+  address: string;
+};
+
+type TrustedDevice = { ipAddress: string };
+type DeviceLayout = "grid" | "tile" | "list";
+type FileOffer = { transferId: string; fileName: string; size: number };
+type ClipboardOffer = { text: string };
+
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
 
 const STORAGE_KEY = "lantern.devices";
+const QUALITY_STORAGE_KEY = "lantern.video-quality";
+const LAYOUT_STORAGE_KEY = "lantern.device-layout";
+const CLIPBOARD_STORAGE_KEY = "lantern.clipboard-enabled";
+const DEFAULT_PORT = "4200";
+
+function readDeviceLayout(): DeviceLayout {
+  const value = localStorage.getItem(LAYOUT_STORAGE_KEY);
+  return value === "tile" || value === "list" ? value : "grid";
+}
+
+function readClipboardEnabled() {
+  return localStorage.getItem(CLIPBOARD_STORAGE_KEY) === "true";
+}
+
+function readVideoQuality(): VideoQuality {
+  const value = localStorage.getItem(QUALITY_STORAGE_KEY);
+  return value === "quality" || value === "smooth" ? value : "balanced";
+}
 
 function readDevices(): { devices: Device[]; error: string | null } {
   try {
@@ -63,6 +93,12 @@ function isValidAddress(value: string) {
   }
 }
 
+function normalizeAddress(value: string) {
+  const parsed = new URL(`http://${value}`);
+  if (!parsed.port) parsed.port = DEFAULT_PORT;
+  return parsed.host;
+}
+
 function isLanHost(host: string) {
   if (host === "localhost") return true;
   const ipv4 = host.split(".").map(Number);
@@ -86,6 +122,40 @@ function App() {
   const [isAdding, setIsAdding] = useState(false);
   const [openDeviceMenuId, setOpenDeviceMenuId] = useState<string | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<Device | null>(null);
+  const [videoQuality, setVideoQuality] = useState<VideoQuality>(() => {
+    try {
+      return readVideoQuality();
+    } catch {
+      return "balanced";
+    }
+  });
+  const [showLocalInfo, setShowLocalInfo] = useState(false);
+  const [localDeviceInfo, setLocalDeviceInfo] = useState<LocalDeviceInfo | null>(null);
+  const [localInfoError, setLocalInfoError] = useState("");
+  const [isLoadingLocalInfo, setIsLoadingLocalInfo] = useState(false);
+  const [copyAddressStatus, setCopyAddressStatus] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [deviceLayout, setDeviceLayout] = useState<DeviceLayout>(() => {
+    try {
+      return readDeviceLayout();
+    } catch {
+      return "grid";
+    }
+  });
+  const [clipboardEnabled, setClipboardEnabled] = useState(() => {
+    try {
+      return readClipboardEnabled();
+    } catch {
+      return false;
+    }
+  });
+  const [trustedDevices, setTrustedDevices] = useState<TrustedDevice[]>([]);
+  const [trustedDevicesError, setTrustedDevicesError] = useState("");
+  const [trustCurrentDevice, setTrustCurrentDevice] = useState(false);
+  const [pendingFileOffer, setPendingFileOffer] = useState<FileOffer | null>(null);
+  const [pendingClipboardOffer, setPendingClipboardOffer] = useState<ClipboardOffer | null>(null);
+  const [transferStatus, setTransferStatus] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [error, setError] = useState("");
@@ -93,6 +163,8 @@ function App() {
   const connectionRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
+  const pendingFileSendsRef = useRef<Map<string, File>>(new Map());
+  const clipboardSessionAllowedRef = useRef(false);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const lastPointerMove = useRef(0);
@@ -125,11 +197,33 @@ function App() {
   }, [devices]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem(QUALITY_STORAGE_KEY, videoQuality);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setStorageError(`无法保存画质偏好：${detail}`);
+    }
+  }, [videoQuality]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(LAYOUT_STORAGE_KEY, deviceLayout);
+      localStorage.setItem(CLIPBOARD_STORAGE_KEY, String(clipboardEnabled));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setStorageError(`无法保存应用偏好：${detail}`);
+    }
+  }, [deviceLayout, clipboardEnabled]);
+
+  useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
     let unlistenRequest: (() => void) | undefined;
     let unlistenRequestEnded: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
+    let unlistenClipboard: (() => void) | undefined;
+    let unlistenFileOffer: (() => void) | undefined;
+    let unlistenFileReceived: (() => void) | undefined;
 
     void Promise.all([
       listen<ConnectionRequest>("remote-connection-request", (event) => {
@@ -144,16 +238,38 @@ function App() {
         setAgentStatus(event.payload);
         if (event.payload === "远程服务已停止") setAgentRunning(false);
       }),
-    ]).then(([requestListener, requestEndedListener, statusListener]) => {
+      listen<ClipboardOffer>("remote-clipboard-offer", (event) => {
+        if (clipboardSessionAllowedRef.current) {
+          void navigator.clipboard.writeText(event.payload.text)
+            .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
+            .catch((cause: unknown) => {
+              const detail = cause instanceof Error ? cause.message : String(cause);
+              setTransferStatus(`无法写入剪贴板：${detail}`);
+            });
+        } else {
+          setPendingClipboardOffer(event.payload);
+        }
+      }),
+      listen<FileOffer>("remote-file-offer", (event) => setPendingFileOffer(event.payload)),
+      listen<{ fileName: string; savedPath: string }>("remote-file-received", (event) => {
+        setTransferStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
+      }),
+    ]).then(([requestListener, requestEndedListener, statusListener, clipboardListener, fileListener, receivedListener]) => {
       if (cancelled) {
         requestListener();
         requestEndedListener();
         statusListener();
+        clipboardListener();
+        fileListener();
+        receivedListener();
         return;
       }
       unlistenRequest = requestListener;
       unlistenRequestEnded = requestEndedListener;
       unlistenStatus = statusListener;
+      unlistenClipboard = clipboardListener;
+      unlistenFileOffer = fileListener;
+      unlistenFileReceived = receivedListener;
     }).catch((cause: unknown) => {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentStatus(`无法接收被控端状态：${detail}`);
@@ -164,6 +280,9 @@ function App() {
       unlistenRequest?.();
       unlistenRequestEnded?.();
       unlistenStatus?.();
+      unlistenClipboard?.();
+      unlistenFileOffer?.();
+      unlistenFileReceived?.();
     };
   }, []);
 
@@ -232,7 +351,10 @@ function App() {
       setError("请输入有效的局域网地址，例如 192.168.1.24:4200。");
       return;
     }
-    if (devices.some((device) => device.address === trimmedAddress)) {
+    const normalizedAddress = normalizeAddress(trimmedAddress);
+    if (devices.some(
+      (device) => isValidAddress(device.address) && normalizeAddress(device.address) === normalizedAddress,
+    )) {
       setError("这个地址已在设备列表中。");
       return;
     }
@@ -240,7 +362,7 @@ function App() {
     const device = {
       id: crypto.randomUUID(),
       name: trimmedName,
-      address: trimmedAddress,
+      address: normalizedAddress,
     };
     setDevices((current) => [...current, device]);
     setActiveId(device.id);
@@ -270,6 +392,58 @@ function App() {
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setConnectionError(`无法切换全屏显示：${detail}`);
+    }
+  }
+
+  async function toggleLocalInfo() {
+    const shouldOpen = !showLocalInfo;
+    setShowLocalInfo(shouldOpen);
+    setCopyAddressStatus("");
+    if (!shouldOpen || !isTauri()) return;
+
+    setIsLoadingLocalInfo(true);
+    setLocalInfoError("");
+    try {
+      const info = await invoke<LocalDeviceInfo>("get_local_device_info");
+      setLocalDeviceInfo(info);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setLocalInfoError(`无法读取本机信息：${detail}`);
+    } finally {
+      setIsLoadingLocalInfo(false);
+    }
+  }
+
+  async function copyLocalAddress() {
+    if (!localDeviceInfo) return;
+    try {
+      await navigator.clipboard.writeText(localDeviceInfo.address);
+      setCopyAddressStatus("已复制地址");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setCopyAddressStatus(`复制失败：${detail}`);
+    }
+  }
+
+  async function openSettings() {
+    setShowSettings(true);
+    if (!isTauri()) return;
+    setTrustedDevicesError("");
+    try {
+      setTrustedDevices(await invoke<TrustedDevice[]>("get_trusted_devices"));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTrustedDevicesError(`无法读取信任设备：${detail}`);
+    }
+  }
+
+  async function removeTrustedDevice(ipAddress: string) {
+    try {
+      await invoke("remove_trusted_device", { ipAddress });
+      setTrustedDevices((current) => current.filter((device) => device.ipAddress !== ipAddress));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTrustedDevicesError(`无法移除信任设备：${detail}`);
     }
   }
 
@@ -307,13 +481,16 @@ function App() {
       await invoke("answer_connection_request", {
         requestId: pendingRequest.requestId,
         approved,
+        trustDevice: approved && trustCurrentDevice,
       });
       setPendingRequest(null);
+      setTrustCurrentDevice(false);
       setAgentStatus(approved ? "已批准控制端连接。" : "已拒绝连接请求。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentStatus(`无法处理连接请求：${detail}`);
       setPendingRequest(null);
+      setTrustCurrentDevice(false);
     }
   }
 
@@ -342,7 +519,12 @@ function App() {
       connectionRef.current = socket;
       socket.onopen = () => {
         setConnectionStatus("waitingApproval");
-        socket.send(JSON.stringify({ type: "hello", device_name: "Lantern 控制端" }));
+        socket.send(JSON.stringify({
+          type: "hello",
+          device_name: "Lantern 控制端",
+          quality: videoQuality,
+          clipboard_enabled: clipboardEnabled,
+        }));
       };
       socket.onmessage = (event: MessageEvent<string>) => {
         let message: {
@@ -353,6 +535,8 @@ function App() {
           candidate?: string;
           sdpMid?: string | null;
           sdpMLineIndex?: number | null;
+          transfer_id?: string;
+          accepted?: boolean;
         };
         try {
           message = JSON.parse(event.data) as typeof message;
@@ -375,6 +559,7 @@ function App() {
               await Promise.all(candidates.map((candidate) => peer.addIceCandidate(candidate)));
             })
             .catch((cause: unknown) => {
+              if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
               const detail = cause instanceof Error ? cause.message : String(cause);
               setConnectionStatus("error");
               setConnectionError(`无法协商 WebRTC 媒体连接：${detail}`);
@@ -389,6 +574,7 @@ function App() {
           if (!peer) return;
           if (peer.remoteDescription) {
             void peer.addIceCandidate(candidate).catch((cause: unknown) => {
+              if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
               const detail = cause instanceof Error ? cause.message : String(cause);
               setConnectionStatus("error");
               setConnectionError(`无法添加 WebRTC 网络候选：${detail}`);
@@ -401,6 +587,19 @@ function App() {
           window.setTimeout(() => viewerRef.current?.focus(), 0);
         } else if (message.type === "encoder_status" && message.status) {
           setEncoderStatus(message.status);
+        } else if (message.type === "file_transfer_decision" && message.transfer_id) {
+          const file = pendingFileSendsRef.current.get(message.transfer_id);
+          if (!file) return;
+          if (!message.accepted) {
+            pendingFileSendsRef.current.delete(message.transfer_id);
+            setTransferStatus(`${file.name}：对端拒绝接收。`);
+          } else {
+            void transmitFile(socket, message.transfer_id, file);
+          }
+        } else if (message.type === "file_transfer_complete") {
+          setTransferStatus("文件已成功发送。");
+        } else if (message.type === "clipboard_error" && message.message) {
+          setTransferStatus(message.message);
         } else if (message.type === "error") {
           setConnectionStatus("error");
           setConnectionError(message.message ?? "远程端返回错误。");
@@ -411,17 +610,28 @@ function App() {
         }
       };
       socket.onerror = () => {
+        if (connectionRef.current !== socket) return;
         setConnectionStatus("error");
         setConnectionError("连接失败。请确认对端已启动、地址正确，且局域网未阻止 TCP 4200。");
       };
       socket.onclose = () => {
+        if (connectionRef.current !== socket) return;
         connectionRef.current = null;
+        clipboardSessionAllowedRef.current = false;
+        setPendingClipboardOffer(null);
         controlChannelRef.current?.close();
         controlChannelRef.current = null;
-        peerConnectionRef.current?.close();
+        const peer = peerConnectionRef.current;
+        if (peer) {
+          peer.onconnectionstatechange = null;
+          peer.onicecandidate = null;
+          peer.ontrack = null;
+          peer.close();
+        }
         peerConnectionRef.current = null;
         remoteStreamRef.current = null;
         pendingRemoteCandidatesRef.current = [];
+        pendingFileSendsRef.current.clear();
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setScreenSize({ width: 0, height: 0 });
         setConnectionStatus((status) => status === "error" ? status : "idle");
@@ -442,9 +652,11 @@ function App() {
     const controlChannel = peer.createDataChannel("control");
     controlChannelRef.current = controlChannel;
     controlChannel.onopen = () => {
+      if (peerConnectionRef.current !== peer) return;
       if (peer.connectionState === "connected") setConnectionStatus("connected");
     };
     controlChannel.onerror = () => {
+      if (peerConnectionRef.current !== peer) return;
       setConnectionError("WebRTC 键鼠控制通道发生错误。");
     };
 
@@ -461,23 +673,27 @@ function App() {
       }
     };
     peer.onicecandidate = (event) => {
+      if (peerConnectionRef.current !== peer) return;
       if (!event.candidate) return;
       if (offerSent) sendCandidate(event.candidate);
       else earlyCandidates.push(event.candidate);
     };
     peer.ontrack = (event) => {
+      if (peerConnectionRef.current !== peer) return;
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       remoteStreamRef.current = stream;
       const video = remoteVideoRef.current;
       if (video) {
         video.srcObject = stream;
         void video.play().catch((cause: unknown) => {
+          if (peerConnectionRef.current !== peer) return;
           const detail = cause instanceof Error ? cause.message : String(cause);
           setConnectionError(`无法播放远程视频流：${detail}`);
         });
       }
     };
     peer.onconnectionstatechange = () => {
+      if (peerConnectionRef.current !== peer) return;
       if (peer.connectionState === "connected") {
         setConnectionStatus("connected");
         window.setTimeout(() => viewerRef.current?.focus(), 0);
@@ -500,6 +716,7 @@ function App() {
       offerSent = true;
       earlyCandidates.forEach(sendCandidate);
     } catch (cause) {
+      if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
       const detail = cause instanceof Error ? cause.message : String(cause);
       setConnectionStatus("error");
       setConnectionError(`无法启动 WebRTC 连接：${detail}`);
@@ -511,20 +728,130 @@ function App() {
     const socket = connectionRef.current;
     connectionRef.current = null;
     if (socket) {
+      socket.onerror = null;
+      socket.onmessage = null;
       socket.onclose = null;
       socket.close();
     }
+    const peer = peerConnectionRef.current;
+    if (peer) {
+      peer.onconnectionstatechange = null;
+      peer.onicecandidate = null;
+      peer.ontrack = null;
+      peer.close();
+    }
     controlChannelRef.current?.close();
     controlChannelRef.current = null;
-    peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
     remoteStreamRef.current = null;
     pendingRemoteCandidatesRef.current = [];
+    pendingFileSendsRef.current.clear();
+    clipboardSessionAllowedRef.current = false;
+    setPendingClipboardOffer(null);
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setConnectionDeviceId(null);
     setConnectionStatus("idle");
+    setConnectionError("");
     setScreenSize({ width: 0, height: 0 });
     setEncoderStatus("");
+  }
+
+  async function sendClipboard() {
+    const socket = connectionRef.current;
+    if (!clipboardEnabled) {
+      setTransferStatus("请先在设置中启用剪贴板共享。");
+      return;
+    }
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setTransferStatus("请先连接到远程设备。");
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
+        setTransferStatus("剪贴板内容超过 48 KiB，未发送。");
+        return;
+      }
+      socket.send(JSON.stringify({ type: "clipboard_text", text }));
+      setTransferStatus("已发送剪贴板内容，等待对端确认。");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法读取剪贴板：${detail}`);
+    }
+  }
+
+  async function answerClipboardOffer(accepted: boolean) {
+    const offer = pendingClipboardOffer;
+    setPendingClipboardOffer(null);
+    if (!accepted || !offer) return;
+    try {
+      await navigator.clipboard.writeText(offer.text);
+      clipboardSessionAllowedRef.current = true;
+      setTransferStatus("已将文本写入本机剪贴板；本次连接后续剪贴板接收将自动允许。");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法写入剪贴板：${detail}`);
+    }
+  }
+
+  async function answerFileOffer(accepted: boolean) {
+    const offer = pendingFileOffer;
+    setPendingFileOffer(null);
+    if (!offer) return;
+    try {
+      await invoke("answer_file_transfer", {
+        transferId: offer.transferId,
+        accepted,
+      });
+      setTransferStatus(accepted ? `正在接收 ${offer.fileName}…` : `已拒绝接收 ${offer.fileName}。`);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法处理文件请求：${detail}`);
+    }
+  }
+
+  async function selectFile(file: File | undefined) {
+    if (!file) return;
+    const socket = connectionRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      setTransferStatus("请先连接到远程设备。");
+      return;
+    }
+    if (file.size === 0 || file.size > 100 * 1024 * 1024) {
+      setTransferStatus("文件必须大于 0 且不超过 100 MiB。");
+      return;
+    }
+    const transferId = crypto.randomUUID();
+    pendingFileSendsRef.current.set(transferId, file);
+    socket.send(JSON.stringify({
+      type: "file_offer",
+      transfer_id: transferId,
+      file_name: file.name,
+      size: file.size,
+    }));
+    setTransferStatus(`已请求发送 ${file.name}，等待对端批准。`);
+  }
+
+  async function transmitFile(socket: WebSocket, transferId: string, file: File) {
+    try {
+      const chunkSize = 48 * 1024;
+      for (let offset = 0; offset < file.size; offset += chunkSize) {
+        while (socket.bufferedAmount > 512 * 1024) {
+          if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
+          await new Promise((resolve) => window.setTimeout(resolve, 30));
+        }
+        const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+        if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
+        socket.send(chunk);
+        setTransferStatus(`正在发送 ${file.name}：${Math.min(offset + chunk.byteLength, file.size)} / ${file.size} 字节`);
+      }
+      socket.send(JSON.stringify({ type: "file_complete", transfer_id: transferId }));
+      pendingFileSendsRef.current.delete(transferId);
+    } catch (cause) {
+      pendingFileSendsRef.current.delete(transferId);
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`文件发送失败：${detail}`);
+    }
   }
 
   function sendInput(message: Record<string, string | number | boolean>) {
@@ -620,13 +947,60 @@ function App() {
             <span className="lan-status-dot" />
             <span>仅限本地网络</span>
           </div>
-          <div className="profile">
-            <span className="avatar">L</span>
-            <span className="profile-copy">
-              <strong>本机工作区</strong>
-              <span>个人设备</span>
-            </span>
-            <Icon name="dots" />
+          {showLocalInfo && (
+            <div className="sidebar-info-popover" role="dialog" aria-label="本机信息">
+              <strong>本机信息</strong>
+              {isLoadingLocalInfo ? (
+                <p>正在读取设备信息…</p>
+              ) : localInfoError ? (
+                <p className="popover-error">{localInfoError}</p>
+              ) : localDeviceInfo ? (
+                <>
+                  <span className="popover-label">设备名称</span>
+                  <code>{localDeviceInfo.name}</code>
+                  <span className="popover-label">局域网地址</span>
+                  <div className="popover-address">
+                    <code>{localDeviceInfo.address}</code>
+                    <button
+                      className="icon-button small"
+                      type="button"
+                      aria-label="复制本机地址"
+                      title="复制地址"
+                      onClick={() => void copyLocalAddress()}
+                    >
+                      <Icon name="copy" />
+                    </button>
+                  </div>
+                  {copyAddressStatus && <span className="popover-copy-status">{copyAddressStatus}</span>}
+                </>
+              ) : (
+                <p>请在 Lantern 桌面应用中查看本机网络信息。</p>
+              )}
+            </div>
+          )}
+          <div className="sidebar-bottom-actions">
+            <button
+              className="profile profile-button"
+              type="button"
+              aria-expanded={showLocalInfo}
+              onClick={() => void toggleLocalInfo()}
+            >
+              <span className="avatar">L</span>
+              <span className="profile-copy">
+                <strong>本机工作区</strong>
+                <span>点击查看设备信息</span>
+              </span>
+              <Icon name="chevron" />
+            </button>
+            <button
+              className="icon-button settings-button"
+              type="button"
+              aria-label="应用设置"
+              title="应用设置"
+              onClick={() => void openSettings()}
+            >
+              <Icon name="settings" />
+            </button>
           </div>
         </div>
       </aside>
@@ -709,10 +1083,21 @@ function App() {
               <h2>你的设备 <span className="heading-count">{devices.length}</span></h2>
               <p>添加局域网电脑，集中查看和切换。</p>
             </div>
-            <button className="view-toggle" type="button" aria-label="网格视图">
-              <Icon name="grid" />
-              <span>网格视图</span>
-            </button>
+            <div className="layout-toggle" role="group" aria-label="设备布局">
+              {(["tile", "list", "grid"] as const).map((layout) => (
+                <button
+                  className={deviceLayout === layout ? "layout-option selected" : "layout-option"}
+                  key={layout}
+                  type="button"
+                  aria-pressed={deviceLayout === layout}
+                  title={layout === "tile" ? "平铺视图" : layout === "list" ? "列表视图" : "网格视图"}
+                  onClick={() => setDeviceLayout(layout)}
+                >
+                  <Icon name={layout === "list" ? "list" : layout === "tile" ? "tile" : "grid"} />
+                  <span>{layout === "tile" ? "平铺" : layout === "list" ? "列表" : "网格"}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           {devices.length === 0 ? (
@@ -739,7 +1124,7 @@ function App() {
               <span className="empty-footnote"><Icon name="shield" /> 设备地址仅保存在这台电脑上</span>
             </div>
           ) : (
-            <div className="device-grid">
+            <div className={`device-grid layout-${deviceLayout}`}>
               {devices.map((device, index) => (
                 <article
                   className={`device-card${device.id === activeId ? " card-active" : ""}`}
@@ -797,6 +1182,32 @@ function App() {
                         <button
                           className="icon-button remote-toolbar-button"
                           type="button"
+                          aria-label="发送剪贴板"
+                          title="发送本机剪贴板"
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={() => void sendClipboard()}
+                        >
+                          <Icon name="copy" />
+                        </button>
+                        <button
+                          className="icon-button remote-toolbar-button"
+                          type="button"
+                          aria-label="发送文件"
+                          title="发送文件"
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={() => fileInputRef.current?.click()}
+                        >
+                          <Icon name="file" />
+                        </button>
+                        <button
+                          className="icon-button remote-toolbar-button"
+                          type="button"
                           aria-label={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
                           title={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
                           onMouseDown={(event) => {
@@ -832,6 +1243,16 @@ function App() {
                       <span className="preview-resolution">— × —</span>
                     </button>
                   )}
+                  <input
+                    ref={fileInputRef}
+                    className="visually-hidden"
+                    type="file"
+                    onChange={(event) => {
+                      void selectFile(event.currentTarget.files?.[0]);
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                  {transferStatus && <div className="transfer-status" role="status">{transferStatus}</div>}
                   <div className="device-card-footer">
                     <span className="device-card-icon"><Icon name="desktop" /></span>
                     <span className="device-card-copy">
@@ -952,10 +1373,10 @@ function App() {
             <input
               id="device-address"
               onChange={(event) => setAddress(event.currentTarget.value)}
-              placeholder="192.168.1.24:4200"
+              placeholder="192.168.1.24"
               value={address}
             />
-            <span className="field-hint">只接受本地手动添加；自动发现功能尚未启用。</span>
+            <span className="field-hint">端口可省略，默认使用通信端口 {DEFAULT_PORT}。</span>
             {error && <p className="form-error" role="alert">{error}</p>}
             <div className="dialog-actions">
               <button
@@ -973,6 +1394,113 @@ function App() {
           </form>
         </div>
       )}
+      {showSettings && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setShowSettings(false);
+          }}
+        >
+          <section className="device-dialog settings-dialog" aria-labelledby="settings-title">
+            <button
+              className="dialog-close icon-button"
+              type="button"
+              aria-label="关闭"
+              onClick={() => setShowSettings(false)}
+            >
+              <Icon name="close" />
+            </button>
+            <span className="dialog-icon"><Icon name="settings" /></span>
+            <h2 id="settings-title">应用设置</h2>
+            <p>画质偏好会在下一次连接时应用到被控端。</p>
+            <fieldset className="quality-options">
+              <legend>远程画面偏好</legend>
+              <label className={videoQuality === "quality" ? "quality-option selected" : "quality-option"}>
+                <input
+                  checked={videoQuality === "quality"}
+                  name="video-quality"
+                  onChange={() => setVideoQuality("quality")}
+                  type="radio"
+                  value="quality"
+                />
+                <span>
+                  <strong>画质优先</strong>
+                  <small>更高分辨率和码率，可能增加带宽与编码负载。</small>
+                </span>
+              </label>
+              <label className={videoQuality === "balanced" ? "quality-option selected" : "quality-option"}>
+                <input
+                  checked={videoQuality === "balanced"}
+                  name="video-quality"
+                  onChange={() => setVideoQuality("balanced")}
+                  type="radio"
+                  value="balanced"
+                />
+                <span>
+                  <strong>平衡</strong>
+                  <small>默认画面尺寸与帧率，兼顾清晰度和响应。</small>
+                </span>
+              </label>
+              <label className={videoQuality === "smooth" ? "quality-option selected" : "quality-option"}>
+                <input
+                  checked={videoQuality === "smooth"}
+                  name="video-quality"
+                  onChange={() => setVideoQuality("smooth")}
+                  type="radio"
+                  value="smooth"
+                />
+                <span>
+                  <strong>流畅度优先</strong>
+                  <small>提高目标帧率并降低分辨率上限，适合动作较多的画面。</small>
+                </span>
+              </label>
+            </fieldset>
+            <label className="clipboard-setting">
+              <input
+                checked={clipboardEnabled}
+                onChange={(event) => setClipboardEnabled(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>启用手动剪贴板共享</strong>
+                <small>控制端需主动发送；接收端首次确认后，本次连接内的后续文本将自动写入，断开后重新询问。</small>
+              </span>
+            </label>
+            <section className="trusted-devices-section">
+              <h3>信任设备</h3>
+              <p>信任后，同一 IP 的连接请求将自动获批。仅信任你控制的设备。</p>
+              {trustedDevicesError && <p className="form-error" role="alert">{trustedDevicesError}</p>}
+              {trustedDevices.length === 0 ? (
+                <p className="trusted-empty">没有已信任的设备。</p>
+              ) : (
+                <ul className="trusted-device-list">
+                  {trustedDevices.map((device) => (
+                    <li key={device.ipAddress}>
+                      <code>{device.ipAddress}</code>
+                      <button
+                        className="text-button"
+                        type="button"
+                        onClick={() => void removeTrustedDevice(device.ipAddress)}
+                      >
+                        移除
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+            <div className="dialog-actions">
+              <button
+                className="primary-button"
+                onClick={() => setShowSettings(false)}
+                type="button"
+              >
+                完成
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {pendingRequest && (
         <div className="modal-backdrop">
           <section className="device-dialog approval-dialog" aria-labelledby="approval-title">
@@ -982,6 +1510,14 @@ function App() {
               {pendingRequest.controllerName}（{pendingRequest.peerAddress}）请求查看屏幕并控制键盘和鼠标。
               仅在你批准后才会开始屏幕传输和输入控制。
             </p>
+            <label className="trust-device-choice">
+              <input
+                checked={trustCurrentDevice}
+                onChange={(event) => setTrustCurrentDevice(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>信任此控制端 IP，以后自动批准来自该 IP 的连接</span>
+            </label>
             <div className="dialog-actions">
               <button className="secondary-button" onClick={() => void answerConnection(false)} type="button">
                 拒绝
@@ -989,6 +1525,35 @@ function App() {
               <button className="primary-button" onClick={() => void answerConnection(true)} type="button">
                 允许本次连接
               </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingClipboardOffer && (
+        <div className="modal-backdrop">
+          <section className="device-dialog approval-dialog" aria-labelledby="clipboard-offer-title">
+            <span className="dialog-icon"><Icon name="copy" /></span>
+            <h2 id="clipboard-offer-title">接收远程剪贴板？</h2>
+            <p className="clipboard-preview">{pendingClipboardOffer.text}</p>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => void answerClipboardOffer(false)} type="button">拒绝</button>
+              <button className="primary-button" onClick={() => void answerClipboardOffer(true)} type="button">本次连接允许</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {pendingFileOffer && (
+        <div className="modal-backdrop">
+          <section className="device-dialog approval-dialog" aria-labelledby="file-offer-title">
+            <span className="dialog-icon"><Icon name="file" /></span>
+            <h2 id="file-offer-title">接收文件？</h2>
+            <p>
+              对端请求发送 <strong>{pendingFileOffer.fileName}</strong>（{(pendingFileOffer.size / 1024 / 1024).toFixed(2)} MiB）。
+              接受后将保存到“下载/Lantern Received”目录。
+            </p>
+            <div className="dialog-actions">
+              <button className="secondary-button" onClick={() => void answerFileOffer(false)} type="button">拒绝</button>
+              <button className="primary-button" onClick={() => void answerFileOffer(true)} type="button">接受文件</button>
             </div>
           </section>
         </div>
@@ -1041,6 +1606,9 @@ function Icon({ name }: { name: string }) {
   const paths: Record<string, React.ReactNode> = {
     lantern: <><path d="M8 8h8l1.2 10H6.8L8 8Z" /><path d="M9 8c0-2 1.2-3.5 3-3.5S15 6 15 8M10 12v3m4-3v3M5 20h14" /></>,
     grid: <><rect x="4" y="4" width="6" height="6" rx="1.2" /><rect x="14" y="4" width="6" height="6" rx="1.2" /><rect x="4" y="14" width="6" height="6" rx="1.2" /><rect x="14" y="14" width="6" height="6" rx="1.2" /></>,
+    tile: <><rect x="3" y="4" width="8" height="7" rx="1" /><rect x="13" y="4" width="8" height="7" rx="1" /><rect x="3" y="13" width="8" height="7" rx="1" /><rect x="13" y="13" width="8" height="7" rx="1" /></>,
+    list: <><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4 6h.01M4 12h.01M4 18h.01" /></>,
+    file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5M9 13h6m-6 4h6" /></>,
     plus: <><path d="M12 5v14M5 12h14" /></>,
     dots: <><circle cx="5" cy="12" r="1" /><circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /></>,
     chevron: <path d="m9 18 6-6-6-6" />,
@@ -1053,6 +1621,8 @@ function Icon({ name }: { name: string }) {
     close: <><path d="m18 6-12 12M6 6l12 12" /></>,
     maximize: <><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4" /></>,
     minimize: <><path d="M8 4v4H4m12-4v4h4M4 16h4v4m12-4h-4v4" /></>,
+    copy: <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3" /></>,
+    settings: <><circle cx="12" cy="12" r="3" /><path d="m19.4 15 .1.1 1.2 2.1-2 2-2.2-1.1a8 8 0 0 1-2 .8L14 21h-4l-.5-2.2a8 8 0 0 1-2-.8L5.3 19l-2-2 1.1-2.2a8 8 0 0 1-.8-2L1.5 12l2.1-2.8.1-.2.1-.2a8 8 0 0 1 .8-2L3.5 4.7l2-2 2.2 1.1a8 8 0 0 1 2-.8L10 1h4l.5 2.2a8 8 0 0 1 2 .8l2.2-1.1 2 2-1.1 2.2a8 8 0 0 1 .8 2l2.1 1.1-2.1 2.8-.1.2-.1.2a8 8 0 0 1-.8 2Z" transform="translate(1 1) scale(.92)" /></>,
   };
 
   return (

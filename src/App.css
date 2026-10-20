@@ -143,7 +143,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .offline-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #626a76; }
 .device-nav .offline-dot { margin-left: auto; }
 .sidebar-empty { margin: 5px 12px; color: #737b87; font-size: 11px; line-height: 1.65; }
-.sidebar-bottom { margin-top: auto; }
+.sidebar-bottom { position: relative; margin-top: auto; }
 .lan-status {
   display: flex;
   align-items: center;
@@ -174,6 +174,20 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .profile-copy strong { color: #d7dce3; font-size: 11px; font-weight: 600; }
 .profile-copy span { color: #777f8a; font-size: 10px; }
 .profile > svg { width: 16px; color: #858c97; }
+.sidebar-bottom-actions { display: flex; align-items: center; gap: 3px; border-top: 1px solid #262a31; }
+.profile.profile-button { flex: 1; min-width: 0; padding: 13px 6px 5px 9px; background: transparent; border: 0; border-radius: 7px; cursor: pointer; text-align: left; }
+.profile.profile-button:hover, .profile.profile-button[aria-expanded="true"] { background: #1c2027; }
+.profile.profile-button > svg { width: 14px; transform: rotate(90deg); }
+.settings-button { flex: 0 0 34px; margin-top: 8px; }
+.sidebar-info-popover { position: absolute; z-index: 6; right: 0; bottom: 70px; left: 0; display: grid; gap: 8px; padding: 13px; color: #d8dde4; background: #20242b; border: 1px solid #3a414c; border-radius: 9px; box-shadow: 0 12px 32px #0009; }
+.sidebar-info-popover > strong { margin-bottom: 2px; font-size: 11px; }
+.sidebar-info-popover p { margin: 0; color: #9ba3af; font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.sidebar-info-popover .popover-error { color: #f1aaa3; }
+.popover-label { color: #7f8895; font-size: 9px; }
+.sidebar-info-popover code { color: #c5dfa9; font: 10px "DM Mono", monospace; overflow-wrap: anywhere; }
+.popover-address { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
+.popover-address .icon-button { flex: 0 0 25px; color: #a6e86c; }
+.popover-copy-status { color: #a6e86c; font-size: 9px; overflow-wrap: anywhere; }
 
 .main-area { flex: 1; min-width: 0; }
 .topbar {
@@ -246,6 +260,7 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .heading-count { margin-left: 4px; color: #858d98; font: 11px "DM Mono", monospace; }
 .desktop-heading p { margin: 0; color: #7e8793; font-size: 11px; }
 .view-toggle { display: flex; align-items: center; gap: 7px; padding: 7px 10px; color: #9ca4af; background: #191c22; border: 1px solid #2a2e37; border-radius: 7px; font-size: 10px; }
+.view-toggle:disabled { cursor: default; opacity: 1; }
 .view-toggle svg { width: 13px; height: 13px; }
 
 .empty-state {
@@ -281,6 +296,21 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .empty-footnote { display: flex; align-items: center; gap: 5px; margin-top: 13px; color: #707985; font-size: 9px; }
 .empty-footnote svg { width: 12px; height: 12px; color: #8eaa78; }
 .device-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.device-grid.layout-tile { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.device-grid.layout-list { grid-template-columns: 1fr; gap: 9px; }
+.layout-toggle { display: flex; gap: 3px; padding: 3px; background: #171a20; border: 1px solid #292e37; border-radius: 8px; }
+.layout-option { display: inline-flex; align-items: center; gap: 5px; min-height: 29px; padding: 0 8px; color: #858d99; background: transparent; border: 0; border-radius: 5px; cursor: pointer; font-size: 9px; }
+.layout-option svg { width: 14px; height: 14px; }
+.layout-option.selected { color: #dfe6db; background: #2a3027; }
+.layout-tile .preview-area { aspect-ratio: 4 / 3; }
+.layout-tile .device-card-footer { gap: 7px; padding: 9px; }
+.layout-tile .device-card-icon { display: none; }
+.layout-list .device-card { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; align-items: center; }
+.layout-list .preview-area { grid-row: span 2; aspect-ratio: 16 / 9; }
+.layout-list .device-card-footer { align-self: end; padding: 9px 12px 4px; }
+.layout-list .device-menu-wrap { grid-column: 2; justify-self: end; margin: -35px 9px 5px 0; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+.transfer-status { margin-top: 12px; padding: 10px 12px; color: #bdc9b1; background: #1a2117; border: 1px solid #303b28; border-radius: 7px; font-size: 10px; overflow-wrap: anywhere; }
 .device-card { overflow: hidden; min-width: 0; background: #191c22; border: 1px solid #2a2f38; border-radius: 10px; transition: border-color .15s ease, box-shadow .15s ease; }
 .device-card.card-active { border-color: #81a959; box-shadow: 0 0 0 1px #a6e86c1c; }
 .preview-area {
@@ -357,6 +387,29 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .device-dialog input { width: 100%; height: 40px; padding: 0 11px; color: #e3e8ef; background: #111419; border: 1px solid #303641; border-radius: 7px; font-size: 11px; }
 .device-dialog input::placeholder { color: #666f7b; }
 .field-hint { display: block; margin-top: 8px; color: #777f8b; font-size: 9px; }
+.settings-dialog { width: min(100%, 480px); }
+.settings-dialog { max-height: min(90vh, 820px); overflow-y: auto; }
+.quality-options { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; border: 0; }
+.quality-options legend { margin-bottom: 9px; color: #c2c9d1; font-size: 11px; font-weight: 600; }
+.quality-option { display: flex; align-items: flex-start; gap: 10px; margin: 0; padding: 11px; background: #13161b; border: 1px solid #303641; border-radius: 8px; cursor: pointer; }
+.quality-option.selected { background: #20291c; border-color: #627c4c; }
+.quality-option input { width: 14px; height: 14px; flex: 0 0 14px; margin: 2px 0 0; accent-color: #a6e86c; }
+.quality-option > span { display: grid; gap: 4px; }
+.quality-option strong { color: #dfe5eb; font-size: 11px; }
+.quality-option small { color: #8d96a2; font-size: 10px; line-height: 1.5; }
+.device-dialog .clipboard-setting, .device-dialog .trust-device-choice { display: flex; align-items: flex-start; gap: 9px; margin: 14px 0; color: #c2c9d1; font-size: 11px; font-weight: 500; cursor: pointer; }
+.device-dialog .clipboard-setting input, .device-dialog .trust-device-choice input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: #a6e86c; }
+.clipboard-setting > span { display: grid; gap: 4px; }
+.clipboard-setting small { color: #8d96a2; font-size: 10px; line-height: 1.5; }
+.trusted-devices-section { margin-top: 20px; padding-top: 15px; border-top: 1px solid #2d333d; }
+.trusted-devices-section h3 { margin: 0 0 6px; color: #dfe5eb; font-size: 12px; }
+.trusted-devices-section > p { margin: 0 0 10px; color: #8d96a2; font-size: 10px; line-height: 1.5; }
+.trusted-devices-section .trusted-empty { color: #737c88; }
+.trusted-device-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.trusted-device-list li { display: flex; align-items: center; justify-content: space-between; padding: 7px 9px; background: #13161b; border: 1px solid #2b3039; border-radius: 6px; }
+.trusted-device-list code { color: #c5dfa9; font: 10px "DM Mono", monospace; }
+.trusted-device-list .text-button { padding: 3px 6px; }
+.clipboard-preview { max-height: 180px; padding: 10px; overflow: auto; color: #c7ced7 !important; background: #111419; border: 1px solid #303641; border-radius: 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .form-error { margin: 10px 0 0 !important; color: #f19a93 !important; font-size: 10px !important; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 23px; }
 .secondary-button { min-height: 36px; color: #bac2cc; background: #20242b; border: 1px solid #353b45; font-size: 11px; }
@@ -366,11 +419,13 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
   .sidebar { width: 215px; min-width: 215px; }
   .workspace { padding-right: 30px; padding-left: 30px; }
   .topbar { padding-right: 30px; padding-left: 30px; }
+  .device-grid.layout-tile { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 780px) {
   .sidebar { width: 190px; min-width: 190px; padding-right: 10px; padding-left: 10px; }
   .workspace { padding: 32px 20px 20px; }
   .topbar { padding: 0 20px; }
   .device-grid { grid-template-columns: 1fr; }
+  .device-grid.layout-tile { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .page-heading { align-items: flex-start; flex-direction: column; gap: 16px; }
 }

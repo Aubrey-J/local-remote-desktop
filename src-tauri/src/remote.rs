@@ -1,6 +1,9 @@
 use std::{
     collections::HashSet,
+    fs::{self, OpenOptions},
+    io::Write,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -26,6 +29,7 @@ use reactor_webrtc::{
     VideoFrame,
 };
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 use tokio::{
     net::TcpListener,
@@ -36,19 +40,89 @@ use tokio::{
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 4200;
-const MAX_FRAME_WIDTH: u32 = 1920;
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_FILE_TRANSFER_SIZE: u64 = 100 * 1024 * 1024;
+const MAX_CLIPBOARD_TEXT_SIZE: usize = 48 * 1024;
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VideoQuality {
+    Quality,
+    #[default]
+    Balanced,
+    Smooth,
+}
+
+impl VideoQuality {
+    fn settings(self) -> VideoSettings {
+        match self {
+            Self::Quality => VideoSettings {
+                max_width: 2560,
+                frame_interval: Duration::from_millis(33),
+                min_bitrate: 8_000_000,
+                max_bitrate: 20_000_000,
+            },
+            Self::Balanced => VideoSettings {
+                max_width: 1920,
+                frame_interval: Duration::from_millis(33),
+                min_bitrate: 4_000_000,
+                max_bitrate: 12_000_000,
+            },
+            Self::Smooth => VideoSettings {
+                max_width: 1600,
+                frame_interval: Duration::from_millis(16),
+                min_bitrate: 3_000_000,
+                max_bitrate: 12_000_000,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct VideoSettings {
+    max_width: u32,
+    frame_interval: Duration,
+    min_bitrate: i32,
+    max_bitrate: i32,
+}
 
 #[derive(Default)]
 pub struct RemoteState {
     server: Mutex<Option<JoinHandle<()>>>,
     pending_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
     pending_request: Mutex<Option<ConnectionRequest>>,
+    pending_file_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
     webrtc_factory: Mutex<Option<Arc<PeerConnectionFactory>>>,
     active_connection: AtomicBool,
     stopping: AtomicBool,
+}
+
+fn local_hostname() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    let hostname =
+        std::env::var("COMPUTERNAME").map_err(|error| format!("无法读取本机名称：{error}"))?;
+
+    #[cfg(not(target_os = "windows"))]
+    let hostname = {
+        let output = std::process::Command::new("hostname")
+            .output()
+            .map_err(|error| format!("无法读取本机名称：{error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "读取本机名称失败，hostname 退出状态：{}",
+                output.status
+            ));
+        }
+        String::from_utf8(output.stdout)
+            .map_err(|error| format!("本机名称不是有效 UTF-8：{error}"))?
+    };
+
+    let hostname = hostname.trim();
+    if hostname.is_empty() {
+        return Err("本机名称为空，请检查系统设备名称设置。".to_string());
+    }
+    Ok(hostname.to_string())
 }
 
 #[derive(Clone)]
@@ -71,6 +145,10 @@ pub struct ConnectionRequest {
 enum ClientMessage {
     Hello {
         device_name: String,
+        #[serde(default)]
+        quality: VideoQuality,
+        #[serde(default)]
+        clipboard_enabled: bool,
     },
     Offer {
         sdp: String,
@@ -99,6 +177,143 @@ enum ClientMessage {
         down: bool,
     },
     ReleaseAll,
+    ClipboardText {
+        text: String,
+    },
+    FileOffer {
+        transfer_id: String,
+        file_name: String,
+        size: u64,
+    },
+    FileComplete {
+        transfer_id: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDeviceInfo {
+    name: String,
+    address: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTransferOffer {
+    transfer_id: String,
+    file_name: String,
+    size: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardOffer {
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedDevice {
+    ip_address: String,
+}
+
+fn trusted_devices_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut path = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("无法定位信任设备存储目录：{error}"))?;
+    path.push("trusted-devices.json");
+    Ok(path)
+}
+
+fn read_trusted_ips(app: &AppHandle) -> Result<HashSet<IpAddr>, String> {
+    let path = trusted_devices_path(app)?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(format!("无法读取信任设备列表：{error}")),
+    };
+    let values: Vec<String> = serde_json::from_str(&contents)
+        .map_err(|error| format!("信任设备列表格式无效：{error}"))?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| value.parse::<IpAddr>().ok())
+        .collect())
+}
+
+fn write_trusted_ips(app: &AppHandle, ips: &HashSet<IpAddr>) -> Result<(), String> {
+    let path = trusted_devices_path(app)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "信任设备存储路径无效".to_string())?;
+    fs::create_dir_all(directory).map_err(|error| format!("无法创建信任设备存储目录：{error}"))?;
+    let mut values: Vec<String> = ips.iter().map(ToString::to_string).collect();
+    values.sort();
+    let contents = serde_json::to_vec_pretty(&values)
+        .map_err(|error| format!("无法序列化信任设备列表：{error}"))?;
+    let temporary_path = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    fs::write(&temporary_path, contents)
+        .map_err(|error| format!("无法保存信任设备列表：{error}"))?;
+    #[cfg(windows)]
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| format!("无法更新信任设备列表：{error}"))?;
+    }
+    fs::rename(&temporary_path, &path).map_err(|error| format!("无法应用信任设备列表：{error}"))
+}
+
+#[tauri::command]
+pub fn get_trusted_devices(app: AppHandle) -> Result<Vec<TrustedDevice>, String> {
+    let mut ips: Vec<String> = read_trusted_ips(&app)?
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect();
+    ips.sort();
+    Ok(ips
+        .into_iter()
+        .map(|ip_address| TrustedDevice { ip_address })
+        .collect())
+}
+
+#[tauri::command]
+pub fn remove_trusted_device(app: AppHandle, ip_address: String) -> Result<(), String> {
+    let ip = ip_address
+        .parse::<IpAddr>()
+        .map_err(|_| "信任设备 IP 地址格式无效".to_string())?;
+    let mut ips = read_trusted_ips(&app)?;
+    ips.remove(&ip);
+    write_trusted_ips(&app, &ips)
+}
+
+#[tauri::command]
+pub fn answer_file_transfer(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    let mut pending = remote
+        .pending_file_approval
+        .lock()
+        .map_err(|_| "文件传输授权状态不可用".to_string())?;
+    match pending.take() {
+        Some((pending_id, sender)) if pending_id == transfer_id => {
+            let _ = sender.send(accepted);
+            Ok(())
+        }
+        Some(request) => {
+            *pending = Some(request);
+            Err("文件传输请求已过期".to_string())
+        }
+        None => Err("当前没有待处理的文件传输请求".to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn get_local_device_info() -> Result<LocalDeviceInfo, String> {
+    let name = local_hostname()?;
+    let address = local_lan_address()
+        .map(|ip| format!("{ip}:{DEFAULT_PORT}"))
+        .ok_or_else(|| "无法确定本机局域网 IP，请检查网络连接。".to_string())?;
+    Ok(LocalDeviceInfo { name, address })
 }
 
 #[tauri::command]
@@ -205,6 +420,14 @@ pub fn stop_agent(remote: tauri::State<'_, Arc<RemoteState>>) -> Result<(), Stri
     {
         let _ = approval.send(false);
     }
+    if let Some((_, approval)) = remote
+        .pending_file_approval
+        .lock()
+        .map_err(|_| "文件传输授权状态不可用".to_string())?
+        .take()
+    {
+        let _ = approval.send(false);
+    }
     remote
         .pending_request
         .lock()
@@ -226,9 +449,11 @@ pub fn get_pending_connection_request(
 
 #[tauri::command]
 pub fn answer_connection_request(
+    app: AppHandle,
     remote: tauri::State<'_, Arc<RemoteState>>,
     request_id: String,
     approved: bool,
+    trust_device: bool,
 ) -> Result<(), String> {
     let mut pending = remote
         .pending_approval
@@ -236,11 +461,22 @@ pub fn answer_connection_request(
         .map_err(|_| "连接授权状态不可用".to_string())?;
     match pending.take() {
         Some((pending_id, sender)) if pending_id == request_id => {
-            remote
+            let request = remote
                 .pending_request
                 .lock()
                 .map_err(|_| "连接请求状态不可用".to_string())?
                 .take();
+            if approved && trust_device {
+                let request = request.ok_or_else(|| "连接请求已过期".to_string())?;
+                let ip = request
+                    .peer_address
+                    .parse::<SocketAddr>()
+                    .map_err(|_| "控制端地址格式无效，无法加入信任列表".to_string())?
+                    .ip();
+                let mut ips = read_trusted_ips(&app)?;
+                ips.insert(ip);
+                write_trusted_ips(&app, &ips)?;
+            }
             let _ = sender.send(approved);
             Ok(())
         }
@@ -260,8 +496,8 @@ async fn websocket_upgrade(
     if !is_lan_address(peer.ip()) {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.max_message_size(64 * 1024)
-        .max_frame_size(64 * 1024)
+    ws.max_message_size(512 * 1024)
+        .max_frame_size(512 * 1024)
         .on_upgrade(move |socket| handle_connection(socket, peer, state))
         .into_response()
 }
@@ -283,46 +519,39 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         return;
     }
 
-    let controller_name = match timeout(Duration::from_secs(5), socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Hello { device_name }) => {
-                let name: String = device_name.trim().chars().take(48).collect();
-                if name.is_empty() {
-                    "局域网控制端".to_string()
-                } else {
-                    name
+    let (controller_name, video_quality, clipboard_enabled) =
+        match timeout(Duration::from_secs(5), socket.recv()).await {
+            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text)
+            {
+                Ok(ClientMessage::Hello {
+                    device_name,
+                    quality,
+                    clipboard_enabled,
+                }) => {
+                    let name: String = device_name.trim().chars().take(48).collect();
+                    let name = if name.is_empty() {
+                        "局域网控制端".to_string()
+                    } else {
+                        name
+                    };
+                    (name, quality, clipboard_enabled)
                 }
-            }
+                _ => {
+                    let _ = socket
+                        .send(Message::Text(
+                            serde_json::json!({"type": "error", "message": "无效的连接握手"})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    state
+                        .remote
+                        .active_connection
+                        .store(false, Ordering::Release);
+                    return;
+                }
+            },
             _ => {
-                let _ = socket
-                    .send(Message::Text(
-                        serde_json::json!({"type": "error", "message": "无效的连接握手"})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await;
-                state
-                    .remote
-                    .active_connection
-                    .store(false, Ordering::Release);
-                return;
-            }
-        },
-        _ => {
-            state
-                .remote
-                .active_connection
-                .store(false, Ordering::Release);
-            return;
-        }
-    };
-
-    let request_id = Uuid::new_v4().to_string();
-    let (approval_sender, mut approval_receiver) = oneshot::channel();
-    {
-        let mut pending = match state.remote.pending_approval.lock() {
-            Ok(pending) => pending,
-            Err(_) => {
                 state
                     .remote
                     .active_connection
@@ -330,16 +559,53 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
                 return;
             }
         };
-        *pending = Some((request_id.clone(), approval_sender));
-    }
+
+    let request_id = Uuid::new_v4().to_string();
     let request = ConnectionRequest {
         request_id: request_id.clone(),
         peer_address: peer.to_string(),
         controller_name: controller_name.clone(),
     };
-    match state.remote.pending_request.lock() {
-        Ok(mut pending) => *pending = Some(request.clone()),
-        Err(_) => {
+    let trusted = match read_trusted_ips(&state.app) {
+        Ok(ips) => ips.contains(&peer.ip()),
+        Err(error) => {
+            let _ = state.app.emit("agent-status", error);
+            false
+        }
+    };
+    let approved = if trusted {
+        true
+    } else {
+        let (approval_sender, mut approval_receiver) = oneshot::channel();
+        {
+            let mut pending = match state.remote.pending_approval.lock() {
+                Ok(pending) => pending,
+                Err(_) => {
+                    state
+                        .remote
+                        .active_connection
+                        .store(false, Ordering::Release);
+                    return;
+                }
+            };
+            *pending = Some((request_id.clone(), approval_sender));
+        }
+        match state.remote.pending_request.lock() {
+            Ok(mut pending) => *pending = Some(request.clone()),
+            Err(_) => {
+                clear_pending(&state.remote, &request_id);
+                state
+                    .remote
+                    .active_connection
+                    .store(false, Ordering::Release);
+                return;
+            }
+        }
+        if state
+            .app
+            .emit("remote-connection-request", request)
+            .is_err()
+        {
             clear_pending(&state.remote, &request_id);
             state
                 .remote
@@ -347,44 +613,33 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
                 .store(false, Ordering::Release);
             return;
         }
-    }
-    if state
-        .app
-        .emit("remote-connection-request", request)
-        .is_err()
-    {
-        clear_pending(&state.remote, &request_id);
-        state
-            .remote
-            .active_connection
-            .store(false, Ordering::Release);
-        return;
-    }
 
-    let approval_deadline = tokio::time::sleep(APPROVAL_TIMEOUT);
-    tokio::pin!(approval_deadline);
-    let approved = loop {
-        tokio::select! {
-            result = &mut approval_receiver => break result.unwrap_or(false),
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break false,
-                    Some(Ok(Message::Ping(payload))) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
-                            break false;
+        let approval_deadline = tokio::time::sleep(APPROVAL_TIMEOUT);
+        tokio::pin!(approval_deadline);
+        let approved = loop {
+            tokio::select! {
+                result = &mut approval_receiver => break result.unwrap_or(false),
+                incoming = socket.recv() => {
+                    match incoming {
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break false,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break false;
+                            }
                         }
+                        Some(Ok(_)) => {}
                     }
-                    Some(Ok(_)) => {}
                 }
+                _ = &mut approval_deadline => break false,
             }
-            _ = &mut approval_deadline => break false,
-        }
-    };
-    clear_pending(&state.remote, &request_id);
-    if !approved {
+        };
+        clear_pending(&state.remote, &request_id);
         let _ = state
             .app
             .emit("remote-connection-request-ended", request_id.clone());
+        approved
+    };
+    if !approved {
         let _ = socket
             .send(Message::Text(
                 serde_json::json!({"type": "error", "message": "连接未获批准"})
@@ -410,7 +665,15 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         return;
     }
 
-    let session_error = match run_webrtc_session(&mut socket, &state).await {
+    let session_error = match run_webrtc_session(
+        &mut socket,
+        &state,
+        video_quality,
+        clipboard_enabled,
+        &controller_name,
+    )
+    .await
+    {
         Ok(()) => None,
         Err(error) => {
             let _ = send_signal(
@@ -515,6 +778,7 @@ impl CaptureWorker {
         &mut self,
         track: Arc<reactor_webrtc::VideoTrack>,
         signals: mpsc::UnboundedSender<WebRtcSignal>,
+        settings: VideoSettings,
     ) {
         if self.thread.is_some() {
             return;
@@ -523,7 +787,7 @@ impl CaptureWorker {
         self.thread = Some(thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 let started = std::time::Instant::now();
-                match capture_bgra() {
+                match capture_bgra(settings.max_width) {
                     Ok((frame, frame_width, frame_height)) => {
                         if let Err(error) =
                             track.push_frame(VideoFrame::new(&frame, frame_width, frame_height))
@@ -537,7 +801,7 @@ impl CaptureWorker {
                         break;
                     }
                 }
-                thread::sleep(FRAME_INTERVAL.saturating_sub(started.elapsed()));
+                thread::sleep(settings.frame_interval.saturating_sub(started.elapsed()));
             }
         }));
     }
@@ -552,7 +816,13 @@ impl Drop for CaptureWorker {
     }
 }
 
-async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Result<(), String> {
+async fn run_webrtc_session(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    quality: VideoQuality,
+    clipboard_enabled: bool,
+    controller_name: &str,
+) -> Result<(), String> {
     let offer = match timeout(SIGNALING_TIMEOUT, async {
         loop {
             match socket.recv().await {
@@ -676,8 +946,13 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
             .create_peer_connection(&rtc_configuration, observer)
             .map_err(|error| format!("无法建立 WebRTC 连接：{error}"))?,
     );
+    let video_settings = quality.settings();
     peer_connection
-        .set_bitrate(None, Some(4_000_000), Some(12_000_000))
+        .set_bitrate(
+            None,
+            Some(video_settings.min_bitrate),
+            Some(video_settings.max_bitrate),
+        )
         .map_err(|error| format!("无法配置 WebRTC 视频码率：{error}"))?;
     peer_connection
         .set_remote_description(&offer)
@@ -733,8 +1008,47 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
                             Ok(ClientMessage::Offer { .. }) => {
                                 return Err("控制端重复发送 WebRTC offer".to_string());
                             }
+                            Ok(ClientMessage::ClipboardText { text }) if clipboard_enabled => {
+                                if text.len() <= MAX_CLIPBOARD_TEXT_SIZE {
+                                    state.app.emit("remote-clipboard-offer", ClipboardOffer { text })
+                                        .map_err(|error| format!("无法显示剪贴板接收请求：{error}"))?;
+                                } else {
+                                    send_signal(socket, serde_json::json!({
+                                        "type": "clipboard_error",
+                                        "message": "剪贴板内容超过 48 KiB，未发送。",
+                                    }))
+                                    .await
+                                    .map_err(|error| format!("发送剪贴板错误失败：{error}"))?;
+                                }
+                            }
+                            Ok(ClientMessage::ClipboardText { .. }) => {
+                                send_signal(socket, serde_json::json!({
+                                    "type": "clipboard_error",
+                                    "message": "被控端未启用剪贴板共享。",
+                                }))
+                                .await
+                                .map_err(|error| format!("发送剪贴板错误失败：{error}"))?;
+                            }
+                            Ok(ClientMessage::FileOffer {
+                                transfer_id,
+                                file_name,
+                                size,
+                            }) => {
+                                receive_file_transfer(
+                                    socket,
+                                    state,
+                                    transfer_id,
+                                    file_name,
+                                    size,
+                                    controller_name,
+                                )
+                                .await?;
+                            }
                             _ => return Err("信令通道收到无效消息".to_string()),
                         }
+                    }
+                    Some(Ok(Message::Binary(_))) => {
+                        return Err("收到未请求的文件数据".to_string());
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(error)) => return Err(format!("WebSocket 错误：{error}")),
@@ -744,6 +1058,7 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
                             .await
                             .map_err(|error| format!("WebSocket 错误：{error}"))?;
                     }
+
                     Some(Ok(_)) => {}
                 }
             }
@@ -763,7 +1078,11 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
                         send_signal(socket, serde_json::json!({"type": "connected"}))
                             .await
                             .map_err(|error| format!("发送连接状态失败：{error}"))?;
-                        capture_worker.start(Arc::clone(&video_track), signal_sender.clone());
+                        capture_worker.start(
+                            Arc::clone(&video_track),
+                            signal_sender.clone(),
+                            video_settings,
+                        );
                         stats_worker.start(Arc::clone(&peer_connection), signal_sender.clone());
                     }
                     Some(WebRtcSignal::State(PeerConnectionState::Failed | PeerConnectionState::Closed)) => {
@@ -817,6 +1136,211 @@ async fn run_webrtc_session(socket: &mut WebSocket, state: &ServerState) -> Resu
     drop(data_channels);
     drop(peer_connection);
     Ok(())
+}
+
+async fn receive_file_transfer(
+    socket: &mut WebSocket,
+    state: &ServerState,
+    transfer_id: String,
+    file_name: String,
+    size: u64,
+    controller_name: &str,
+) -> Result<(), String> {
+    if transfer_id.len() > 64
+        || file_name.is_empty()
+        || file_name.len() > 255
+        || PathBuf::from(&file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(file_name.as_str())
+        || size == 0
+        || size > MAX_FILE_TRANSFER_SIZE
+    {
+        return Err("文件传输请求无效或超过 100 MiB 限制".to_string());
+    }
+
+    let offer = FileTransferOffer {
+        transfer_id: transfer_id.clone(),
+        file_name: file_name.clone(),
+        size,
+    };
+    let (sender, mut receiver) = oneshot::channel();
+    {
+        let mut pending = state
+            .remote
+            .pending_file_approval
+            .lock()
+            .map_err(|_| "文件传输授权状态不可用".to_string())?;
+        *pending = Some((transfer_id.clone(), sender));
+    }
+    if let Err(error) = state.app.emit("remote-file-offer", offer) {
+        {
+            let mut pending = state
+                .remote
+                .pending_file_approval
+                .lock()
+                .map_err(|_| "文件传输授权状态不可用".to_string())?;
+            if pending.as_ref().is_some_and(|(id, _)| id == &transfer_id) {
+                pending.take();
+            }
+        }
+        return Err(format!("无法显示文件接收请求：{error}"));
+    }
+
+    let accepted = timeout(Duration::from_secs(90), async {
+        loop {
+            tokio::select! {
+                decision = &mut receiver => return Ok::<bool, String>(decision.unwrap_or(false)),
+                message = socket.recv() => {
+                    match message {
+                        Some(Ok(Message::Ping(payload))) => socket
+                            .send(Message::Pong(payload))
+                            .await
+                            .map_err(|error| format!("文件传输等待授权时 WebSocket 出错：{error}"))?,
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(false),
+                        Some(Ok(_)) => {}
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    {
+        let mut pending = state
+            .remote
+            .pending_file_approval
+            .lock()
+            .map_err(|_| "文件传输授权状态不可用".to_string())?;
+        if pending.as_ref().is_some_and(|(id, _)| id == &transfer_id) {
+            pending.take();
+        }
+    }
+    send_signal(
+        socket,
+        serde_json::json!({
+            "type": "file_transfer_decision",
+            "transfer_id": transfer_id,
+            "accepted": accepted,
+        }),
+    )
+    .await
+    .map_err(|error| format!("发送文件传输授权失败：{error}"))?;
+    if !accepted {
+        return Ok(());
+    }
+
+    let mut contents = Vec::with_capacity(size as usize);
+    loop {
+        let incoming = timeout(Duration::from_secs(30), socket.recv())
+            .await
+            .map_err(|_| "文件传输 30 秒无数据，已超时".to_string())?;
+        match incoming {
+            Some(Ok(Message::Binary(chunk))) => {
+                let next_len = contents.len().saturating_add(chunk.len());
+                if next_len as u64 > size {
+                    return Err("文件数据超过声明大小，传输已中止".to_string());
+                }
+                contents.extend_from_slice(&chunk);
+            }
+            Some(Ok(Message::Text(text))) => {
+                let message: ClientMessage = serde_json::from_str(&text)
+                    .map_err(|error| format!("文件传输信令无效：{error}"))?;
+                match message {
+                    ClientMessage::FileComplete {
+                        transfer_id: completed_id,
+                    } if completed_id == transfer_id && contents.len() as u64 == size => {
+                        let saved_path = save_received_file(&state.app, &file_name, &contents)?;
+                        send_signal(
+                            socket,
+                            serde_json::json!({"type": "file_transfer_complete"}),
+                        )
+                        .await
+                        .map_err(|error| format!("发送文件完成状态失败：{error}"))?;
+                        state
+                            .app
+                            .emit(
+                                "remote-file-received",
+                                serde_json::json!({
+                                    "fileName": file_name,
+                                    "savedPath": saved_path,
+                                    "controllerName": controller_name,
+                                }),
+                            )
+                            .map_err(|error| format!("无法显示文件保存状态：{error}"))?;
+                        return Ok(());
+                    }
+                    _ => return Err("文件传输完成标记与数据不匹配".to_string()),
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => socket
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|error| format!("文件传输时 WebSocket 出错：{error}"))?,
+            Some(Ok(Message::Close(_))) | None => {
+                return Err("文件传输期间连接已关闭".to_string());
+            }
+            Some(Err(error)) => return Err(format!("文件传输时 WebSocket 出错：{error}")),
+            Some(Ok(_)) => return Err("收到无效的文件数据".to_string()),
+        }
+    }
+}
+
+fn save_received_file(app: &AppHandle, file_name: &str, contents: &[u8]) -> Result<String, String> {
+    let mut file_name: String = file_name
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    file_name = file_name.trim_matches([' ', '.']).to_string();
+    if file_name.is_empty() {
+        file_name = "received-file".to_string();
+    }
+    let mut directory = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("无法定位下载目录：{error}"))?;
+    directory.push("Lantern Received");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建文件接收目录：{error}"))?;
+
+    let path = PathBuf::from(&file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .unwrap_or("received-file");
+    let extension = path.extension().and_then(|part| part.to_str());
+    for suffix in 0..1000 {
+        let candidate_name = match (suffix, extension) {
+            (0, _) => file_name.clone(),
+            (_, Some(extension)) => format!("{stem} ({suffix}).{extension}"),
+            (_, None) => format!("{stem} ({suffix})"),
+        };
+        let candidate = directory.join(candidate_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                file.write_all(contents)
+                    .map_err(|error| format!("写入接收文件失败：{error}"))?;
+                return Ok(candidate.to_string_lossy().into_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("无法创建接收文件：{error}")),
+        }
+    }
+    Err("接收目录中存在过多同名文件，无法保存".to_string())
 }
 
 async fn send_signal(
@@ -878,7 +1402,7 @@ fn capture_dimensions() -> Result<(u32, u32), String> {
     Ok((screen.display_info.width, screen.display_info.height))
 }
 
-fn capture_bgra() -> Result<(Vec<u8>, u32, u32), String> {
+fn capture_bgra(max_width: u32) -> Result<(Vec<u8>, u32, u32), String> {
     let screen = primary_screen()?;
     let screenshot = screen
         .capture()
@@ -888,7 +1412,7 @@ fn capture_bgra() -> Result<(Vec<u8>, u32, u32), String> {
     let pixels = image::RgbaImage::from_raw(width, height, screenshot.into_raw())
         .ok_or_else(|| "屏幕图像格式无效".to_string())?;
 
-    let scale = (MAX_FRAME_WIDTH as f64 / width as f64).min(1.0);
+    let scale = (max_width as f64 / width as f64).min(1.0);
     let (frame_width, frame_height) = (
         (width as f64 * scale).round().max(1.0) as u32,
         (height as f64 * scale).round().max(1.0) as u32,
@@ -996,6 +1520,9 @@ fn apply_input(
             }
         }
         ClientMessage::Hello { .. } => {}
+        ClientMessage::ClipboardText { .. }
+        | ClientMessage::FileOffer { .. }
+        | ClientMessage::FileComplete { .. } => {}
         ClientMessage::ReleaseAll => {
             for key in state.pressed_keys.drain() {
                 enigo
@@ -1183,6 +1710,61 @@ fn physical_scancode(code: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_quality_modes_have_distinct_resolution_and_rate_targets() {
+        let quality = VideoQuality::Quality.settings();
+        let balanced = VideoQuality::Balanced.settings();
+        let smooth = VideoQuality::Smooth.settings();
+
+        assert!(quality.max_width > balanced.max_width);
+        assert!(smooth.max_width < balanced.max_width);
+        assert!(smooth.frame_interval < balanced.frame_interval);
+        assert!(quality.max_bitrate > balanced.max_bitrate);
+    }
+
+    #[test]
+    fn hello_handshake_defaults_to_balanced_for_older_controllers() {
+        let hello =
+            serde_json::from_str::<ClientMessage>(r#"{"type":"hello","device_name":"Lantern"}"#)
+                .unwrap();
+        assert!(matches!(
+            hello,
+            ClientMessage::Hello {
+                quality: VideoQuality::Balanced,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clipboard_and_file_messages_decode_with_expected_fields() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"hello","device_name":"Lantern","clipboard_enabled":true}"#
+            ),
+            Ok(ClientMessage::Hello {
+                clipboard_enabled: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"file_offer","transfer_id":"transfer-1","file_name":"notes.txt","size":12}"#
+            ),
+            Ok(ClientMessage::FileOffer {
+                transfer_id,
+                file_name,
+                size: 12
+            }) if transfer_id == "transfer-1" && file_name == "notes.txt"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"file_complete","transfer_id":"transfer-1"}"#
+            ),
+            Ok(ClientMessage::FileComplete { transfer_id }) if transfer_id == "transfer-1"
+        ));
+    }
 
     #[test]
     fn only_local_network_peers_are_allowed() {

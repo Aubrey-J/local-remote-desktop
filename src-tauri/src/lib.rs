@@ -10,7 +10,11 @@ pub fn run() {
             remote::start_agent,
             remote::stop_agent,
             remote::get_pending_connection_request,
-            remote::answer_connection_request
+            remote::answer_connection_request,
+            remote::get_local_device_info,
+            remote::get_trusted_devices,
+            remote::remove_trusted_device,
+            remote::answer_file_transfer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
