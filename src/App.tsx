@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import "./App.css";
 
 type Device = {
@@ -273,6 +273,25 @@ function App() {
     let unlistenClipboard: (() => void) | undefined;
     let unlistenFileOffer: (() => void) | undefined;
     let unlistenFileReceived: (() => void) | undefined;
+    let unlistenMainFocus: (() => void) | undefined;
+
+    void getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused) {
+        void getCurrentWindow().requestUserAttention(null).catch((cause: unknown) => {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setAgentStatus(`无法清除窗口提示：${detail}`);
+        });
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+      } else {
+        unlistenMainFocus = unlisten;
+      }
+    }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentStatus(`无法监听窗口焦点：${detail}`);
+    });
 
     void Promise.all([
       listen<ConnectionRequest>("remote-connection-request", (event) => {
@@ -357,6 +376,7 @@ function App() {
       unlistenClipboard?.();
       unlistenFileOffer?.();
       unlistenFileReceived?.();
+      unlistenMainFocus?.();
     };
   }, []);
 
@@ -1060,6 +1080,10 @@ function App() {
       if (!mainWindow) throw new Error("主窗口不存在。");
       await mainWindow.show();
       await mainWindow.setFocus();
+      if (!(await mainWindow.isFocused())) {
+        await mainWindow.requestUserAttention(UserAttentionType.Critical);
+        setAgentStatus("有待处理的确认，请切换到 Lantern 主窗口处理。");
+      }
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentStatus(`有待处理的请求，但无法显示主窗口：${detail}`);
