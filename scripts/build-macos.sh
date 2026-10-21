@@ -26,4 +26,7 @@ if [[ ! -f "$runtime_archive" ]]; then
   exit 1
 fi
 
-env "$rustflags_variable=-C link-arg=$runtime_archive" npm run tauri -- build --bundles dmg
+env \
+  "$rustflags_variable=-C link-arg=$runtime_archive" \
+  "CARGO_PROFILE_RELEASE_STRIP=${CARGO_PROFILE_RELEASE_STRIP:-none}" \
+  npm run tauri -- build --bundles dmg

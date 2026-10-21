@@ -34,6 +34,14 @@ button { color: inherit; }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .app-shell { display: flex; min-height: 100vh; }
+.native-fullscreen-document, .native-fullscreen-document body, .native-fullscreen-document #root {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+.native-fullscreen-document body { position: fixed; inset: 0; }
 .app-shell.standalone-mode { display: block; min-width: 0; height: 100vh; overflow: hidden; }
 .standalone-mode .sidebar, .standalone-mode .main-area > .topbar { display: none; }
 .standalone-mode .main-area { height: 100vh; }
@@ -53,19 +61,19 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .standalone-mode .device-card-footer { flex: 0 0 auto; }
 .standalone-mode .device-menu-wrap { display: none; }
 .remote-window-heading { display: none; }
-.native-remote-fullscreen { display: block; min-height: 0; height: 100vh; overflow: hidden; }
+.native-remote-fullscreen { position: fixed; inset: 0; display: block; width: 100vw; min-width: 0; min-height: 0; height: 100vh; overflow: hidden; overscroll-behavior: none; }
 .native-remote-fullscreen .sidebar, .native-remote-fullscreen .main-area > .topbar,
 .native-remote-fullscreen .workspace > :not(.device-grid) { display: none; }
-.native-remote-fullscreen .main-area, .native-remote-fullscreen .workspace { height: 100vh; }
+.native-remote-fullscreen .main-area, .native-remote-fullscreen .workspace { width: 100vw; height: 100vh; overflow: hidden; overscroll-behavior: none; }
 .native-remote-fullscreen .workspace { display: flex; max-width: none; flex-direction: column; padding: 0; }
-.native-remote-fullscreen .device-grid, .native-remote-fullscreen .device-grid.layout-list { display: block; flex: 1; min-height: 0; }
+.native-remote-fullscreen .device-grid, .native-remote-fullscreen .device-grid.layout-list { display: block; flex: 1; min-width: 0; min-height: 0; overflow: hidden; overscroll-behavior: none; }
 .native-remote-fullscreen .device-card { display: flex; height: 100%; flex-direction: column; }
 .native-remote-fullscreen .device-card:not(.card-active) { display: none; }
 .native-remote-fullscreen .device-card-footer, .native-remote-fullscreen .device-menu-wrap,
 .native-remote-fullscreen .device-card > .visually-hidden,
 .native-remote-fullscreen .device-card > .transfer-status { display: none; }
 .native-remote-fullscreen .device-card > .remote-preview,
-.native-remote-fullscreen .layout-list .remote-preview { display: flex; flex: 1; min-height: 0; aspect-ratio: auto; cursor: default; }
+.native-remote-fullscreen .layout-list .remote-preview { display: flex; flex: 1; min-height: 0; aspect-ratio: auto; cursor: default; overscroll-behavior: none; }
 .sidebar {
   width: 248px;
   min-width: 248px;
@@ -385,6 +393,23 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .connect-button:hover { filter: brightness(1.06); }
 .connect-button-muted { color: #bbc3ce; background: #242831; border-color: #3b424d; }
 .remote-preview { outline: none; cursor: default; background: #080a0c; }
+.remote-preview-open-control {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: 50%;
+  padding: 9px 13px;
+  color: #e1ead9;
+  background: #101319e8;
+  border: 1px solid #a6e86c75;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  transform: translate(-50%, -50%);
+}
+.remote-preview-open-control:hover { color: #15200e; background: #a6e86c; }
+.remote-preview-readonly { overscroll-behavior: none; }
 .remote-preview:focus-visible { outline: 2px solid #a6e86c; outline-offset: -2px; }
 .remote-preview:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; padding: 0; border-radius: 0; }
 .remote-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; user-select: none; }

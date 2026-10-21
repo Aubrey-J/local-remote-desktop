@@ -207,6 +207,16 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const className = "native-fullscreen-document";
+    if (isNativeFullscreen) {
+      document.documentElement.classList.add(className);
+    } else {
+      document.documentElement.classList.remove(className);
+    }
+    return () => document.documentElement.classList.remove(className);
+  }, [isNativeFullscreen]);
+
+  useEffect(() => {
     if (!standaloneDeviceId || standaloneConnectionStarted.current) return;
     const device = devices.find((item) => item.id === standaloneDeviceId);
     if (!device) return;
@@ -1458,19 +1468,22 @@ function App() {
                 >
                   {connectionDeviceId === device.id && connectionStatus === "connected" ? (
                     <div
-                      className="preview-area remote-preview"
+                      className={`preview-area remote-preview${standaloneDeviceId ? "" : " remote-preview-readonly"}`}
                       ref={viewerRef}
-                      role="application"
-                      aria-label={`${device.name} 远程桌面，可使用鼠标和键盘控制`}
-                      tabIndex={0}
+                      role={standaloneDeviceId ? "application" : "region"}
+                      aria-label={standaloneDeviceId
+                        ? `${device.name} 远程桌面，可使用鼠标和键盘控制`
+                        : `${device.name} 远程桌面预览`}
+                      tabIndex={standaloneDeviceId ? 0 : -1}
                       onContextMenu={(event) => event.preventDefault()}
-                      onPointerCancel={releaseRemoteMouseButtons}
-                      onPointerDown={(event) => sendMouseButton(event, true)}
-                      onPointerMove={sendMouseMove}
-                      onPointerUp={(event) => sendMouseButton(event, false)}
-                      onBlur={releaseRemoteInput}
+                      onPointerCancel={standaloneDeviceId ? releaseRemoteMouseButtons : undefined}
+                      onPointerDown={standaloneDeviceId ? (event) => sendMouseButton(event, true) : undefined}
+                      onPointerMove={standaloneDeviceId ? sendMouseMove : undefined}
+                      onPointerUp={standaloneDeviceId ? (event) => sendMouseButton(event, false) : undefined}
+                      onBlur={standaloneDeviceId ? releaseRemoteInput : undefined}
                       onWheel={(event) => {
                         event.preventDefault();
+                        if (!standaloneDeviceId) return;
                         const scale = event.deltaMode === 1
                           ? 16
                           : event.deltaMode === 2
@@ -1492,12 +1505,12 @@ function App() {
                       />
                       <span className="remote-live">
                         <span className="lan-status-dot" />
-                        WebRTC · {encoderStatus || "编码器检测中"} · 鼠标和键盘可控
+                        WebRTC · {encoderStatus || "编码器检测中"} · {standaloneDeviceId ? "鼠标和键盘可控" : "只读预览"}
                         {isRemoteFullscreen && keyboardLockWarning && (
                           <span className="fullscreen-key-warning" title={keyboardLockWarning}>{keyboardLockWarning}</span>
                         )}
                       </span>
-                      <div
+                      {standaloneDeviceId ? <div
                         className="remote-toolbar"
                         onPointerDown={(event) => event.stopPropagation()}
                         onPointerMove={(event) => event.stopPropagation()}
@@ -1542,7 +1555,15 @@ function App() {
                         >
                           <Icon name={isRemoteFullscreen ? "minimize" : "maximize"} />
                         </button>
-                      </div>
+                      </div> : (
+                        <button
+                          className="remote-preview-open-control"
+                          type="button"
+                          onClick={() => void openRemoteWindow(device)}
+                        >
+                          在独立窗口中控制
+                        </button>
+                      )}
                     </div>
                   ) : (
                     <button
