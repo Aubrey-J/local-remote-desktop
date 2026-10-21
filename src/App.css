@@ -96,13 +96,11 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .brand-mark {
   width: 31px;
   height: 31px;
-  display: grid;
-  place-items: center;
-  color: #18230f;
-  background: var(--accent);
+  display: block;
   border-radius: 10px;
+  overflow: hidden;
 }
-.brand-mark svg { width: 19px; height: 19px; }
+.brand-mark img { display: block; width: 100%; height: 100%; }
 .brand-period { color: var(--accent); }
 .section-label {
   margin: 0;

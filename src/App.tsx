@@ -1212,7 +1212,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand" aria-label="Lantern">
           <span className="brand-mark" aria-hidden="true">
-            <Icon name="lantern" />
+            <img alt="" src="/lantern-icon.svg" />
           </span>
           <span>lantern<span className="brand-period">.</span></span>
         </div>
@@ -1990,7 +1990,6 @@ function Icon({ name }: { name: string }) {
   };
 
   const paths: Record<string, React.ReactNode> = {
-    lantern: <><path d="M8 8h8l1.2 10H6.8L8 8Z" /><path d="M9 8c0-2 1.2-3.5 3-3.5S15 6 15 8M10 12v3m4-3v3M5 20h14" /></>,
     grid: <><rect x="4" y="4" width="6" height="6" rx="1.2" /><rect x="14" y="4" width="6" height="6" rx="1.2" /><rect x="4" y="14" width="6" height="6" rx="1.2" /><rect x="14" y="14" width="6" height="6" rx="1.2" /></>,
     tile: <><rect x="3" y="4" width="8" height="7" rx="1" /><rect x="13" y="4" width="8" height="7" rx="1" /><rect x="3" y="13" width="8" height="7" rx="1" /><rect x="13" y="13" width="8" height="7" rx="1" /></>,
     list: <><path d="M9 6h11M9 12h11M9 18h11" /><path d="M4 6h.01M4 12h.01M4 18h.01" /></>,

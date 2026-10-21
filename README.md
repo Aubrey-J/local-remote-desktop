@@ -42,6 +42,12 @@ npm run build
 
 Tauri's platform prerequisites are required to build desktop bundles. See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for Windows, macOS, and Linux.
 
+The shared Lantern mark is maintained in [`public/lantern-icon.svg`](./public/lantern-icon.svg) and used by the app UI, favicon, tray, and native bundles. After changing it, regenerate the platform icons with:
+
+```sh
+npm run tauri -- icon public/lantern-icon.svg --output src-tauri/icons
+```
+
 To build a macOS DMG locally, run:
 
 ```sh
