@@ -1997,6 +1997,7 @@ dependencies = [
  "byteorder-lite",
  "moxcms",
  "num-traits",
+ "png 0.18.1",
 ]
 
 [[package]]
@@ -2366,7 +2367,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "local-remote-desktop"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "enigo",
@@ -4211,6 +4212,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image 0.25.10",
  "jni",
  "libc",
  "log",

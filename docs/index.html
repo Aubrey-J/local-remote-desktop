@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f7f2">
+    <meta name="description" content="Lantern 是一款局域网优先的远程桌面应用。把多台电脑放进同一个工作区，用一套键鼠自由切换。">
+    <meta property="og:title" content="Lantern — 让多台电脑，像一台一样工作">
+    <meta property="og:description" content="本地优先、低延迟的多设备远程桌面。无需云端中转，连接由你掌控。">
+    <meta property="og:type" content="website">
+    <title>Lantern — 让多台电脑，像一台一样工作</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17221c;
+        --muted: #68766d;
+        --line: #dce3da;
+        --paper: #f5f7f2;
+        --white: #fff;
+        --green: #b9f36b;
+        --deep: #18231d;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+        scroll-behavior: smooth;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); }
+      a { color: inherit; }
+      .wrap { width: min(1120px, calc(100% - 48px)); margin: 0 auto; }
+      .topbar { position: sticky; z-index: 5; top: 0; border-bottom: 1px solid #dce3dabb; background: #f5f7f2eF; backdrop-filter: blur(16px); }
+      .nav { min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-size: 19px; font-weight: 780; letter-spacing: -.8px; }
+      .brand-mark { display: grid; width: 31px; height: 31px; place-items: center; color: #15200e; background: var(--green); border-radius: 10px; }
+      .brand-mark svg { width: 20px; height: 20px; }
+      .brand-period { color: #5b8a31; }
+      .nav-links { display: flex; align-items: center; gap: 28px; color: #536158; font-size: 13px; }
+      .nav-links a { text-decoration: none; }
+      .nav-links a:hover { color: #18231d; }
+      .github-link { display: inline-flex; align-items: center; gap: 8px; padding: 9px 13px; color: #f7f8fa !important; background: #24292f; border: 1px solid #171b20; border-radius: 8px; font-size: 12px; font-weight: 650; transition: transform .18s ease, background .18s ease; }
+      .github-link:hover { transform: translateY(-1px); background: #343a40; }
+      .github-link svg { width: 16px; height: 16px; fill: currentColor; }
+      .hero { position: relative; display: grid; grid-template-columns: 1fr 1.04fr; align-items: center; gap: 45px; min-height: 600px; padding: 80px 0 76px; }
+      .hero::before { position: absolute; z-index: -1; top: 14px; left: -100px; width: 470px; height: 470px; content: ""; background: radial-gradient(circle, #dff1c7 0, #e9f2df66 48%, transparent 72%); filter: blur(8px); }
+      .eyebrow { display: inline-flex; align-items: center; gap: 9px; margin-bottom: 22px; color: #627263; font: 11px var(--mono); letter-spacing: 1.3px; text-transform: uppercase; }
+      .eyebrow i { width: 7px; height: 7px; background: #81c446; border-radius: 50%; box-shadow: 0 0 0 4px #81c44620; }
+      h1 { max-width: 620px; margin: 0; color: var(--ink); font-size: clamp(43px, 5.6vw, 68px); font-weight: 740; letter-spacing: -4px; line-height: 1.08; }
+      h1 span { color: #739e48; }
+      .hero-copy { max-width: 490px; margin: 23px 0 0; color: #65736a; font-size: 16px; line-height: 1.85; }
+      .hero-actions { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 31px; }
+      .button { display: inline-flex; min-height: 46px; align-items: center; justify-content: center; gap: 9px; padding: 0 17px; border: 1px solid transparent; border-radius: 9px; text-decoration: none; font-size: 13px; font-weight: 680; transition: transform .18s ease, box-shadow .18s ease, background .18s ease; }
+      .button:hover { transform: translateY(-2px); }
+      .button-primary { color: #18230f; background: var(--green); border-color: #a6e85e; box-shadow: 0 7px 18px #8ebd5130; }
+      .button-primary:hover { background: #c6fa7c; box-shadow: 0 10px 22px #8ebd5140; }
+      .button-secondary { color: #35423a; background: #ffffffa8; border-color: #d6ded3; }
+      .button-secondary:hover { background: #fff; }
+      .button svg { width: 17px; height: 17px; }
+      .hero-note { display: flex; align-items: center; gap: 8px; margin-top: 19px; color: #7a877e; font-size: 11px; }
+      .hero-note svg { width: 14px; height: 14px; color: #6c9c42; }
+      .story { position: relative; height: 100vh; min-height: 620px; border-top: 1px solid #e2e7df; border-bottom: 1px solid #e2e7df; background: #edf2e8; }
+      .story-stage { position: sticky; top: 0; height: 100vh; min-height: 620px; display: grid; place-items: center; overflow: hidden; }
+      .story-stage::before, .story-stage::after { position: absolute; width: 54vw; height: 54vw; max-width: 740px; max-height: 740px; content: ""; border: 1px solid #dbe5d5; border-radius: 50%; }
+      .story-stage::after { width: 38vw; height: 38vw; max-width: 520px; max-height: 520px; border-color: #dfe8d9; }
+      .story-glow { position: absolute; width: 300px; height: 300px; background: #d9edc4; border-radius: 50%; filter: blur(75px); opacity: .75; transition: transform .65s cubic-bezier(.2,.75,.25,1); }
+      .story-content { position: relative; z-index: 1; width: min(880px, calc(100% - 48px)); min-height: 390px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+      .story-kicker { display: flex; align-items: center; gap: 10px; margin-bottom: 34px; color: #74856e; font: 11px var(--mono); letter-spacing: 1.5px; text-transform: uppercase; }
+      .story-kicker::before, .story-kicker::after { width: 27px; height: 1px; content: ""; background: #b9cbb0; }
+      .story-quote { max-width: 820px; min-height: 2.35em; margin: 0; font-size: clamp(34px, 5.2vw, 64px); font-weight: 720; letter-spacing: -.055em; line-height: 1.22; opacity: 1; transform: translateY(0); transition: opacity .28s ease, transform .42s cubic-bezier(.2,.75,.25,1), filter .35s ease; }
+      .story-quote.is-entering { opacity: 0; filter: blur(7px); transform: translateY(24px); }
+      .story-quote em { color: #729b4c; font-style: normal; }
+      .story-detail { max-width: 540px; min-height: 3.5em; margin: 20px 0 0; color: #718076; font-size: 14px; line-height: 1.8; }
+      .story-progress { display: flex; align-items: center; gap: 11px; margin-top: 36px; }
+      .story-progress span { width: 25px; height: 3px; background: #d2dccd; border-radius: 9px; transition: width .3s ease, background .3s ease; }
+      .story-progress span.active { width: 42px; background: #86b656; }
+      .story-hint { display: flex; align-items: center; gap: 8px; margin-top: 29px; color: #92a094; font-size: 10px; }
+      .story-hint svg { width: 14px; height: 14px; animation: scroll-nudge 1.5s ease-in-out infinite; }
+      @keyframes scroll-nudge { 0%, 100% { transform: translateY(-2px); } 50% { transform: translateY(3px); } }
+      .visual { position: relative; min-height: 420px; display: grid; place-items: center; }
+      .orbit { position: absolute; width: 390px; height: 390px; border: 1px solid #dce5d8; border-radius: 50%; }
+      .orbit::before, .orbit::after { position: absolute; content: ""; border: 1px solid #e2e9df; border-radius: 50%; }
+      .orbit::before { inset: 34px; }
+      .orbit::after { inset: 72px; }
+      .glow { position: absolute; width: 230px; height: 230px; background: #d3efae88; border-radius: 50%; filter: blur(40px); }
+      .app-window { position: relative; z-index: 1; width: min(100%, 480px); overflow: hidden; background: #fff; border: 1px solid #d6ddd4; border-radius: 13px; box-shadow: 0 26px 72px #263b281f, 0 4px 10px #263b280d; transform: rotate(-2deg); }
+      .window-bar { height: 34px; display: flex; align-items: center; gap: 5px; padding: 0 13px; background: #fafbf9; border-bottom: 1px solid #edf0eb; }
+      .window-bar i { width: 7px; height: 7px; background: #d5dbd2; border-radius: 50%; }
+      .window-title { margin-left: 8px; color: #909a91; font: 9px var(--mono); }
+      .mock-workspace { display: grid; grid-template-columns: 83px 1fr; min-height: 270px; }
+      .mock-sidebar { padding: 14px 9px; background: #f7f9f5; border-right: 1px solid #edf0eb; }
+      .mock-brand { display: flex; align-items: center; gap: 5px; margin-bottom: 18px; font-size: 9px; font-weight: 750; }
+      .mock-brand b { display: grid; width: 14px; height: 14px; place-items: center; background: var(--green); border-radius: 4px; font-size: 8px; }
+      .mock-nav { height: 18px; margin: 5px 0; padding: 5px 6px; color: #78847a; border-radius: 4px; font-size: 7px; }
+      .mock-nav.active { color: #35452e; background: #e8f1df; }
+      .mock-section { margin: 17px 4px 6px; color: #9aa49b; font: 6px var(--mono); letter-spacing: .5px; }
+      .mock-device { display: flex; align-items: center; gap: 5px; height: 21px; padding: 0 5px; color: #78847a; font-size: 6px; }
+      .mock-device i { width: 6px; height: 6px; background: #9cbf7d; border-radius: 2px; }
+      .mock-main { padding: 16px 16px 14px; }
+      .mock-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+      .mock-heading strong { font-size: 11px; letter-spacing: -.2px; }
+      .mock-heading span { padding: 5px 7px; color: #314126; background: var(--green); border-radius: 4px; font-size: 6px; font-weight: 700; }
+      .mock-subtitle { margin-bottom: 12px; color: #9aa39b; font-size: 6px; }
+      .mock-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .mock-card { overflow: hidden; background: #f7f8f6; border: 1px solid #e5e9e3; border-radius: 6px; }
+      .mock-screen { position: relative; height: 100px; overflow: hidden; background: linear-gradient(155deg, #cedfca, #879d81 55%, #455d53); }
+      .mock-screen.second { background: linear-gradient(155deg, #dfd8c9, #aab59c 55%, #687568); }
+      .mock-screen::before { position: absolute; right: -16px; bottom: -39px; width: 145px; height: 104px; content: ""; background: #24372e4d; border-radius: 50%; transform: rotate(-17deg); }
+      .mock-screen::after { position: absolute; right: 16px; bottom: 10px; width: 34px; height: 34px; content: ""; background: #f3f5e4b5; border-radius: 50%; }
+      .mock-screen-top { position: absolute; z-index: 1; top: 6px; left: 6px; padding: 3px 5px; color: white; background: #26362c9c; border-radius: 3px; font: 5px var(--mono); }
+      .mock-card-footer { display: flex; align-items: center; justify-content: space-between; padding: 7px; }
+      .mock-card-footer b { color: #455149; font-size: 6px; }
+      .mock-card-footer i { width: 28px; height: 13px; background: #d8efc4; border-radius: 3px; }
+      .mock-status { display: flex; align-items: center; gap: 4px; margin-top: 11px; color: #879387; font-size: 6px; }
+      .mock-status i { width: 5px; height: 5px; background: #8fc653; border-radius: 50%; }
+      .float-tag { position: absolute; z-index: 2; display: inline-flex; align-items: center; gap: 7px; padding: 9px 12px; color: #36443a; background: #fff; border: 1px solid #e0e7dc; border-radius: 8px; box-shadow: 0 9px 24px #24372512; font-size: 10px; font-weight: 650; }
+      .float-tag svg { width: 15px; height: 15px; color: #71964f; }
+      .tag-top { top: 36px; right: -6px; }
+      .tag-bottom { bottom: 36px; left: -10px; }
+      .tag-dot { width: 7px; height: 7px; background: #9bd45f; border-radius: 50%; }
+      .section { padding: 86px 0; border-top: 1px solid #e2e7df; }
+      .section-heading { max-width: 620px; margin-bottom: 34px; }
+      .section-kicker { margin-bottom: 12px; color: #7a955f; font: 10px var(--mono); letter-spacing: 1px; text-transform: uppercase; }
+      h2 { margin: 0; font-size: clamp(28px, 3.5vw, 39px); letter-spacing: -1.7px; line-height: 1.2; }
+      .section-heading p { margin: 14px 0 0; color: var(--muted); font-size: 14px; line-height: 1.8; }
+      .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+      .feature { min-height: 207px; padding: 22px; background: #ffffffb8; border: 1px solid #e2e8df; border-radius: 12px; }
+      .feature-icon { display: grid; width: 38px; height: 38px; place-items: center; margin-bottom: 23px; color: #47643a; background: #e7f2dc; border-radius: 10px; }
+      .feature-icon svg { width: 19px; height: 19px; }
+      .feature h3 { margin: 0 0 8px; font-size: 14px; letter-spacing: -.3px; }
+      .feature p { margin: 0; color: #748076; font-size: 12px; line-height: 1.75; }
+      .privacy { display: grid; grid-template-columns: .85fr 1.15fr; align-items: center; gap: 65px; padding: 37px; color: #f1f4ef; background: var(--deep); border-radius: 16px; }
+      .privacy .section-kicker { color: #b8e88c; }
+      .privacy h2 { max-width: 420px; }
+      .privacy p { margin: 14px 0 0; color: #acb8ad; font-size: 13px; line-height: 1.8; }
+      .privacy-points { display: grid; gap: 12px; }
+      .privacy-point { display: flex; align-items: flex-start; gap: 12px; padding: 13px; background: #ffffff0a; border: 1px solid #ffffff14; border-radius: 9px; }
+      .privacy-point svg { width: 17px; height: 17px; flex: 0 0 17px; color: #b8e88c; }
+      .privacy-point span { color: #c2ccc2; font-size: 11px; line-height: 1.65; }
+      .privacy-point strong { display: block; margin-bottom: 3px; color: #eef2ec; font-size: 12px; }
+      .download-section { padding-bottom: 94px; }
+      .download-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+      .download-card { display: flex; min-height: 195px; flex-direction: column; align-items: flex-start; padding: 21px; background: #fff; border: 1px solid #dfe6dc; border-radius: 12px; }
+      .download-card-head { display: flex; width: 100%; align-items: center; justify-content: space-between; }
+      .os-icon { display: grid; width: 38px; height: 38px; place-items: center; color: #405046; background: #f1f4ef; border: 1px solid #e4e9e2; border-radius: 10px; }
+      .os-icon svg { width: 21px; height: 21px; }
+      .version { padding: 5px 7px; color: #597342; background: #f0f7e9; border-radius: 99px; font: 9px var(--mono); }
+      .download-card h3 { margin: 18px 0 4px; font-size: 14px; }
+      .download-card p { margin: 0 0 17px; color: #79847b; font-size: 11px; }
+      .download-card .button { width: 100%; min-height: 37px; margin-top: auto; font-size: 11px; }
+      .release-note { margin-top: 17px; color: #7c887d; font-size: 11px; line-height: 1.7; }
+      .release-note a { color: #50733b; font-weight: 650; text-underline-offset: 3px; }
+      .faq-section { padding: 78px 0 84px; background: #edf2e8; border-top: 1px solid #e0e7dc; }
+      .faq-list { display: grid; gap: 10px; max-width: 850px; margin: 34px auto 0; }
+      .faq-list details { padding: 0 18px; background: #ffffffb8; border: 1px solid #dce4d8; border-radius: 10px; }
+      .faq-list summary { position: relative; padding: 17px 32px 17px 0; color: #26362b; cursor: pointer; font-size: 13px; font-weight: 680; list-style: none; }
+      .faq-list summary::-webkit-details-marker { display: none; }
+      .faq-list summary::after { position: absolute; top: 15px; right: 2px; content: "+"; color: #739e48; font: 22px var(--mono); }
+      .faq-list details[open] summary::after { content: "−"; }
+      .faq-list details p { max-width: 740px; margin: 0; padding: 0 22px 17px 0; color: #68766d; font-size: 12px; line-height: 1.8; }
+      .faq-list details a { color: #557f34; font-weight: 650; }
+      .community { display: grid; grid-template-columns: 1.1fr .9fr; gap: 18px; padding-bottom: 90px; }
+      .community-card { min-height: 188px; padding: 24px; background: #fff; border: 1px solid #e0e6dd; border-radius: 12px; }
+      .community-card.github { color: #f2f5f7; background: #24292f; border-color: #24292f; }
+      .community-title { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 14px; font-weight: 700; }
+      .community-title svg { width: 20px; height: 20px; }
+      .community-card p { max-width: 500px; margin: 0 0 20px; color: #758078; font-size: 12px; line-height: 1.7; }
+      .community-card.github p { color: #b4bdc5; }
+      .community-card .button { min-height: 37px; font-size: 11px; }
+      .github .button { color: #f4f6f8; background: #343a40; border-color: #555d65; }
+      .github .button:hover { background: #41484f; }
+      .issue .button { color: #344433; background: #edf5e7; border-color: #dce9d3; }
+      footer { padding: 21px 0; border-top: 1px solid #e1e7de; }
+      .footer-inner { display: flex; align-items: center; justify-content: space-between; gap: 18px; color: #859087; font-size: 10px; }
+      .footer-links { display: flex; gap: 18px; }
+      .footer-links a { text-decoration: none; }
+      .footer-links a:hover { color: #405046; }
+      @media (max-width: 820px) {
+        .hero { grid-template-columns: 1fr; gap: 8px; padding-top: 70px; }
+        .visual { min-height: 385px; }
+        .privacy { grid-template-columns: 1fr; gap: 25px; }
+      }
+      @media (max-width: 620px) {
+        .wrap { width: min(100% - 32px, 500px); }
+        .nav { min-height: 62px; }
+        .nav-links { gap: 13px; }
+        .nav-links > a:not(.github-link) { display: none; }
+        .github-link { padding: 8px 10px; }
+        .hero { min-height: auto; padding: 61px 0 52px; }
+        .story, .story-stage { min-height: 540px; }
+        .story-content { width: calc(100% - 34px); min-height: 320px; }
+        .story-kicker { margin-bottom: 26px; font-size: 9px; }
+        .story-quote { min-height: 3.2em; font-size: clamp(32px, 9vw, 46px); }
+        .story-detail { min-height: 5em; font-size: 12px; }
+        .story-hint { margin-top: 23px; }
+        h1 { letter-spacing: -2.7px; }
+        .hero-copy { font-size: 14px; }
+        .visual { min-height: 310px; margin: 0 -8px; }
+        .orbit { width: 300px; height: 300px; }
+        .mock-workspace { grid-template-columns: 66px 1fr; min-height: 217px; }
+        .mock-sidebar { padding: 11px 6px; }
+        .mock-main { padding: 12px 10px; }
+        .mock-screen { height: 78px; }
+        .tag-top { top: 12px; right: -2px; }
+        .tag-bottom { bottom: 15px; left: -2px; }
+        .section { padding: 62px 0; }
+        .feature-grid, .download-grid, .community { grid-template-columns: 1fr; }
+        .feature { min-height: 170px; }
+        .feature-icon { margin-bottom: 17px; }
+        .privacy { padding: 25px 20px; }
+        .community { padding-bottom: 60px; }
+        .faq-section { padding: 60px 0; }
+        .faq-list { margin-top: 26px; }
+        .faq-list details { padding: 0 14px; }
+        .faq-list summary { font-size: 12px; }
+        .footer-inner { align-items: flex-start; flex-direction: column; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
+        .story-hint svg { animation: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <nav class="nav wrap" aria-label="主导航">
+        <a class="brand" href="#" aria-label="Lantern 首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 8h8l1.2 10H6.8L8 8Z"/><path d="M9 8c0-2 1.2-3.5 3-3.5S15 6 15 8M10 12v3m4-3v3M5 20h14"/></svg>
+          </span>
+          <span>lantern<span class="brand-period">.</span></span>
+        </a>
+        <div class="nav-links">
+          <a href="#features">功能</a>
+          <a href="#download">下载</a>
+          <a href="#faq">使用帮助</a>
+          <a class="github-link" href="https://github.com/Aubrey-J/local-remote-desktop" target="_blank" rel="noreferrer">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-.95-2.7-.95-.36-.92-.89-1.16-.89-1.16-.73-.5.06-.49.06-.49.8.06 1.22.82 1.22.82.71 1.21 1.87.86 2.33.66.07-.52.28-.86.51-1.06-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 4.35c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.19c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+            GitHub
+          </a>
+        </div>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero wrap">
+        <div class="hero-text">
+          <div class="eyebrow"><i></i> YOUR LOCAL DESKTOP, CONNECTED</div>
+          <h1>让多台电脑，<br><span>像一台一样工作。</span></h1>
+          <p class="hero-copy">把局域网里的电脑放进同一个工作区。一套键盘鼠标，直接切换屏幕、继续工作。Lantern 为本地连接而设计，不依赖云端中转。</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/Aubrey-J/local-remote-desktop/releases/latest">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M5 17v3h14v-3"/></svg>
+              获取 Lantern
+            </a>
+            <a class="button button-secondary" href="https://github.com/Aubrey-J/local-remote-desktop" target="_blank" rel="noreferrer">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-.95-2.7-.95-.36-.92-.89-1.16-.89-1.16-.73-.5.06-.49.06-.49.8.06 1.22.82 1.22.82.71 1.21 1.87.86 2.33.66.07-.52.28-.86.51-1.06-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 4.35c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.19c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+              查看开源项目
+            </a>
+          </div>
+          <div class="hero-note">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></svg>
+            局域网优先 · 每次连接由你批准 · Windows / macOS / Linux
+          </div>
+        </div>
+
+        <div class="visual" aria-label="Lantern 多设备工作区示意图" role="img">
+          <div class="orbit"></div><div class="glow"></div>
+          <div class="app-window">
+            <div class="window-bar"><i></i><i></i><i></i><span class="window-title">Lantern · Device Workspace</span></div>
+            <div class="mock-workspace">
+              <aside class="mock-sidebar">
+                <div class="mock-brand"><b>L</b> lantern.</div>
+                <div class="mock-nav active">▦　设备桌面</div>
+                <div class="mock-section">MY DEVICES</div>
+                <div class="mock-device"><i></i>工作站-01</div>
+                <div class="mock-device"><i></i>开发机-02</div>
+                <div class="mock-device"><i></i>实验室-linux</div>
+              </aside>
+              <div class="mock-main">
+                <div class="mock-heading"><strong>设备桌面</strong><span>＋ 添加设备</span></div>
+                <div class="mock-subtitle">你的设备　·　在一个工作区里自由切换</div>
+                <div class="mock-cards">
+                  <div class="mock-card"><div class="mock-screen"><span class="mock-screen-top">● WEBRTC · LIVE</span></div><div class="mock-card-footer"><b>工作站-01</b><i></i></div></div>
+                  <div class="mock-card"><div class="mock-screen second"><span class="mock-screen-top">● WEBRTC · LIVE</span></div><div class="mock-card-footer"><b>开发机-02</b><i></i></div></div>
+                </div>
+                <div class="mock-status"><i></i> 安全连接已建立　　局域网直连</div>
+              </div>
+            </div>
+          </div>
+          <div class="float-tag tag-top"><span class="tag-dot"></span> 局域网直连</div>
+          <div class="float-tag tag-bottom">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></svg>
+            一套键鼠 · 多台设备
+          </div>
+        </div>
+      </section>
+
+      <section class="story" id="story" aria-label="为什么选择 Lantern">
+        <div class="story-stage">
+          <div class="story-glow"></div>
+          <div class="story-content">
+            <div class="story-kicker" id="story-kicker">A better way to work locally</div>
+            <h2 class="story-quote" id="story-quote" aria-live="polite">轻量化本地桌面控制，<br><em>远程与现场，不必互相等待。</em></h2>
+            <p class="story-detail" id="story-detail">传统远程桌面可能切换或占用会话；Lantern 让你在同一桌面上查看并操作另一台电脑。</p>
+            <div class="story-progress" id="story-progress" role="group" aria-label="产品故事进度">
+              <span class="active"></span><span></span><span></span><span></span>
+            </div>
+            <div class="story-hint"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg> 滚动继续 · 向上滚动可返回</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <div class="wrap">
+          <div class="section-heading">
+            <div class="section-kicker">Built for your local workspace</div>
+            <h2>你的电脑，保持各自独立。<br>工作流，连接在一起。</h2>
+            <p>为本地设备协作而生：不需要账号体系或远程云服务，启动应用、添加局域网地址，就能开始工作。</p>
+          </div>
+          <div class="feature-grid">
+            <article class="feature">
+              <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></svg></div>
+              <h3>所有设备，一个桌面</h3>
+              <p>把常用电脑集中在同一工作区。网格、平铺或列表视图，按习惯整理你的设备。</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 16 0v5a2 2 0 0 1-2 2h-2v-6h4M4 13h4v6H6a2 2 0 0 1-2-2z"/></svg></div>
+              <h3>实时画面，直接控制</h3>
+              <p>WebRTC 传输远程屏幕与键鼠输入。选择画质优先、平衡或流畅度优先，适配你的网络。</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></svg></div>
+              <h3>连接授权，由你决定</h3>
+              <p>新设备请求连接时由被控端批准。可选信任常用设备；剪贴板与文件传输也需明确授权。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="wrap" aria-labelledby="privacy-title">
+        <div class="privacy">
+          <div>
+            <div class="section-kicker">Local by design</div>
+            <h2 id="privacy-title">你的网络。<br>你的设备。你的决定。</h2>
+            <p>Lantern 面向可信局域网使用。连接在设备间直接建立，不经 Lantern 云端中转；屏幕和输入控制使用加密的 WebRTC 媒体链路。</p>
+          </div>
+          <div class="privacy-points">
+            <div class="privacy-point">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11Z"/><path d="m9 12 2 2 4-4"/></svg>
+              <span><strong>每次连接都可控</strong>被控设备批准后才开始屏幕共享与键鼠控制。</span>
+            </div>
+            <div class="privacy-point">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18m-7-9h14"/><circle cx="12" cy="12" r="9"/></svg>
+              <span><strong>按需启用共享功能</strong>剪贴板可关闭；文件接收需在被控端逐次批准。</span>
+            </div>
+            <div class="privacy-point">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4z"/><path d="m4 7 8 6 8-6"/></svg>
+              <span><strong>开源协作与反馈</strong>浏览源代码、报告问题，让每次反馈都推动项目变好。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section download-section" id="download">
+        <div class="wrap">
+          <div class="section-heading">
+            <div class="section-kicker">Choose your platform</div>
+            <h2>下载 Lantern</h2>
+            <p>选择与你的电脑对应的平台。安装包由 GitHub Actions 从开源代码构建并发布。</p>
+          </div>
+          <div class="download-grid">
+            <article class="download-card">
+              <div class="download-card-head">
+                <span class="os-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2 2 7l10 5 10-5-10-5Z"/><path d="m2 12 10 5 10-5M2 17l10 5 10-5"/></svg></span>
+                <span class="version">LINUX</span>
+              </div>
+              <h3>Linux</h3><p>Debian / Ubuntu · .deb 或 AppImage</p>
+              <a class="button button-secondary" href="https://github.com/Aubrey-J/local-remote-desktop/releases/latest">前往 GitHub 下载 ↗</a>
+            </article>
+            <article class="download-card">
+              <div class="download-card-head">
+                <span class="os-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5.5 10.5 4v7H3zm8.5-1.7L21 2v9h-9.5zM3 12.5h7.5v7L3 18zm8.5 0H21v9l-9.5-1.8z"/></svg></span>
+                <span class="version">WINDOWS</span>
+              </div>
+              <h3>Windows</h3><p>Windows 10 / 11 · NSIS 安装程序</p>
+              <a class="button button-secondary" href="https://github.com/Aubrey-J/local-remote-desktop/releases/latest">前往 GitHub 下载 ↗</a>
+            </article>
+            <article class="download-card">
+              <div class="download-card-head">
+                <span class="os-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16.4 13c0 3.8 3.3 5.1 3.3 5.1s-2.3 6.6-5.2 6.6c-1.4 0-1.8-.9-3.7-.9s-2.4.9-3.7.9C4.2 24.7 1 18.9 1 14.5 1 9.7 4.3 7 7.7 7c1.6 0 2.7 1 3.7 1s2.2-1 4.2-1c1.1 0 3.1.4 4.6 2.1-.1.1-3.8 2.2-3.8 6.9Z" transform="translate(2 -2) scale(.83)"/><path d="M14 4c1-1.2 2.6-2 4-2-.1 1.6-.8 3-1.8 4-1 1-2.5 1.6-3.9 1.5.1-1.2.7-2.5 1.7-3.5Z"/></svg></span>
+                <span class="version">MACOS</span>
+              </div>
+              <h3>macOS</h3><p>macOS 13+ · Apple Silicon DMG</p>
+              <a class="button button-secondary" href="https://github.com/Aubrey-J/local-remote-desktop/releases/latest">前往 GitHub 下载 ↗</a>
+            </article>
+          </div>
+          <p class="release-note">所有平台安装包都在 GitHub Release 的 Assets 区域。首次使用前，请查看<a href="https://github.com/Aubrey-J/local-remote-desktop#operating-system-permissions-and-limitations">系统权限与使用说明</a>。macOS 版本目前提供 Apple Silicon 构建。</p>
+          <p class="release-note"><a href="https://github.com/Aubrey-J/local-remote-desktop/releases">浏览所有历史版本与制品 →</a>　·　Actions 临时制品会过期，正式 Release 会持续保留，除非维护者删除。</p>
+        </div>
+      </section>
+
+      <section class="faq-section" id="faq">
+        <div class="wrap">
+          <div class="section-heading">
+            <div class="section-kicker">Help &amp; troubleshooting</div>
+            <h2>常见问题与使用帮助</h2>
+            <p>连接、权限或下载安装遇到问题？先看看这些常用排查步骤。</p>
+          </div>
+          <div class="faq-list">
+            <details>
+              <summary>如何连接两台电脑？</summary>
+              <p>两台电脑安装并启动 Lantern，确保它们在同一个局域网。在被控端点击“启动被控端”，然后在控制端添加被控端显示的局域网 IP（端口可省略，默认 4200），再连接并在被控端批准。防火墙需允许 TCP 4200 及 UDP 4201–4210。</p>
+            </details>
+            <details>
+              <summary>连接失败或一直没有画面，应该检查什么？</summary>
+              <p>确认两台设备处于同一网络且没有访客网络隔离；确认被控端 Lantern 正在运行，并允许 TCP 4200 和 UDP 4201–4210 通过防火墙。部分路由器的无线客户端隔离会阻止设备互通。还可以先重启两端应用，再试一次。</p>
+            </details>
+            <details>
+              <summary>Lantern 需要账号、云服务或互联网吗？</summary>
+              <p>当前连接面向局域网，不需要 Lantern 账号，也不通过 Lantern 云端中转。首次连接需要被控端批准；仅在你信任的网络中使用，不要将通信端口暴露到互联网。屏幕与键鼠数据通过 WebRTC 加密传输。</p>
+            </details>
+            <details>
+              <summary>macOS 为什么看不到屏幕或不能操作？</summary>
+              <p>请在“系统设置 → 隐私与安全性”中为 Lantern 开启“屏幕录制”和“辅助功能”权限。修改权限后可能需要完全退出并重新打开应用。详细说明见 <a href="https://github.com/Aubrey-J/local-remote-desktop#operating-system-permissions-and-limitations">系统权限文档</a>。</p>
+            </details>
+            <details>
+              <summary>Windows 上某些游戏或管理员窗口不能控制怎么办？</summary>
+              <p>独占全屏、Raw Input、管理员权限隔离及反作弊保护可能会拒绝普通桌面输入。可以尝试窗口化/无边框模式，并让两端应用以相同权限级别运行。Lantern 不会绕过反作弊或安全桌面保护。</p>
+            </details>
+            <details>
+              <summary>关闭窗口后，Lantern 还会继续运行吗？</summary>
+              <p>桌面版默认将窗口隐藏到系统托盘，远程服务继续运行。托盘菜单可以重新显示窗口或退出应用；也可以在应用设置中将关闭行为改为彻底退出。Linux 托盘图标是否显示取决于当前桌面环境是否提供托盘支持。</p>
+            </details>
+            <details>
+              <summary>主页需要在每次发布新版本时手动更新吗？</summary>
+              <p>通常不需要。主页下载按钮会指向 GitHub 的最新 Release 页面，版本发布工作流会把各平台安装包作为 Release 制品上传。Release 会持续保留，除非维护者删除；Actions 运行中的临时制品则会在 14 天后过期。也可在 <a href="https://github.com/Aubrey-J/local-remote-desktop/releases">所有 Releases</a> 中选择历史版本和平台。</p>
+            </details>
+            <details>
+              <summary>在哪里报告问题或查看已知问题？</summary>
+              <p>请在 <a href="https://github.com/Aubrey-J/local-remote-desktop/issues">GitHub Issues</a> 搜索已有问题，或提交新 Issue。请注明应用版本、操作系统和复现步骤；发布日志也可以帮助定位。不要在公开 Issue 中粘贴密码、私密文件或其他敏感信息。</p>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <section class="wrap community" aria-label="开源与反馈">
+        <article class="community-card github">
+          <div class="community-title">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38l-.01-1.49c-2.23.49-2.7-.95-2.7-.95-.36-.92-.89-1.16-.89-1.16-.73-.5.06-.49.06-.49.8.06 1.22.82 1.22.82.71 1.21 1.87.86 2.33.66.07-.52.28-.86.51-1.06-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.65 7.65 0 0 1 8 4.35c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48l-.01 2.19c0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+            Built in the open
+          </div>
+          <p>Lantern is open source. Explore the implementation, follow development, or help shape a local-first desktop workspace.</p>
+          <a class="button" href="https://github.com/Aubrey-J/local-remote-desktop" target="_blank" rel="noreferrer">Visit GitHub repository ↗</a>
+        </article>
+        <article class="community-card issue">
+          <div class="community-title">遇到问题？一起让它变好。</div>
+          <p>告诉我们你使用的系统、复现步骤和遇到的情况。每一个清晰的问题报告都能帮助 Lantern 更进一步。</p>
+          <a class="button" href="https://github.com/Aubrey-J/local-remote-desktop/issues/new/choose" target="_blank" rel="noreferrer">提交 Issue ↗</a>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap footer-inner">
+        <span>© 2026 Lantern · 为本地协作而造</span>
+        <div class="footer-links">
+          <a href="https://github.com/Aubrey-J/local-remote-desktop" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://github.com/Aubrey-J/local-remote-desktop/releases/latest">下载</a>
+          <a href="https://github.com/Aubrey-J/local-remote-desktop/issues/new/choose" target="_blank" rel="noreferrer">反馈问题</a>
+        </div>
+      </div>
+    </footer>
+    <script>
+      (() => {
+        const stories = [
+          {
+            quote: '轻量化本地桌面控制，<br><em>远程与现场，不必互相等待。</em>',
+            detail: '传统远程桌面可能切换或占用会话；Lantern 让你在同一桌面上查看并操作另一台电脑。',
+            kicker: 'A better way to work locally',
+          },
+          {
+            quote: '多个设备来回跑，<br><em>操作起来很疲倦。</em>',
+            detail: '把电脑放进同一个工作区。一套键盘鼠标，在设备窗口间切换，不必来回挪动。',
+            kicker: 'One workspace, many devices',
+          },
+          {
+            quote: '已有的远程控制要登录、要收费？<br><em>没必要。</em>',
+            detail: 'Lantern 开源、免费使用，面向局域网连接，不需要账号登录或云端中转。',
+            kicker: 'Open source · Local first',
+          },
+          {
+            quote: '使用 Lantern，<br><em>一套输入设备，效率 up up up！</em>',
+            detail: '连接由你批准，画质和流畅度由你选择。把注意力留给工作，而不是切换设备。',
+            kicker: 'Your devices, in sync',
+          },
+        ];
+        const section = document.querySelector('#story');
+        const quote = document.querySelector('#story-quote');
+        const detail = document.querySelector('#story-detail');
+        const kicker = document.querySelector('#story-kicker');
+        const progress = [...document.querySelectorAll('#story-progress span')];
+        const glow = document.querySelector('.story-glow');
+        if (!section || !quote || !detail || !kicker || !progress.length || !glow) return;
+
+        let index = 0;
+        let lastChange = 0;
+        let animationTimer = 0;
+        const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+        let touchStartY = 0;
+
+        const render = (next) => {
+          if (next === index || next < 0 || next >= stories.length) return;
+          index = next;
+          const story = stories[index];
+          quote.classList.add('is-entering');
+          window.clearTimeout(animationTimer);
+          animationTimer = window.setTimeout(() => {
+            quote.innerHTML = story.quote;
+            detail.textContent = story.detail;
+            kicker.textContent = story.kicker;
+            progress.forEach((item, itemIndex) => item.classList.toggle('active', itemIndex === index));
+            glow.style.transform = `translate(${(index - 1.5) * 38}px, ${(1.5 - index) * 18}px) scale(${1 + index * 0.08})`;
+            requestAnimationFrame(() => quote.classList.remove('is-entering'));
+          }, reducedMotion.matches ? 0 : 220);
+        };
+
+        const handleScroll = (deltaY, event) => {
+          if (!deltaY) return;
+          const bounds = section.getBoundingClientRect();
+          const headerHeight = document.querySelector('.topbar')?.getBoundingClientRect().height ?? 0;
+          const enteringFromAbove = deltaY > 0 &&
+            bounds.top > headerHeight + 1 &&
+            bounds.top <= headerHeight + deltaY;
+          const enteringFromBelow = deltaY < 0 &&
+            bounds.bottom < -1 &&
+            bounds.bottom >= deltaY;
+          if (enteringFromAbove || enteringFromBelow) {
+            const wasVisible = bounds.top < window.innerHeight && bounds.bottom > 0;
+            event.preventDefault();
+            window.scrollTo({
+              top: window.scrollY + bounds.top - headerHeight,
+              behavior: 'instant',
+            });
+            if (wasVisible && performance.now() - lastChange >= 320) {
+              lastChange = performance.now();
+              render(index + (deltaY > 0 ? 1 : -1));
+            }
+            return;
+          }
+          if (bounds.top > headerHeight + 40 || bounds.bottom < window.innerHeight - 40) return;
+          const now = performance.now();
+          if (now - lastChange < 320) {
+            if (index > 0 && index < stories.length - 1) event.preventDefault();
+            return;
+          }
+          if (deltaY > 0 && index < stories.length - 1) {
+            event.preventDefault();
+            lastChange = now;
+            render(index + 1);
+          } else if (deltaY < 0 && index > 0) {
+            event.preventDefault();
+            lastChange = now;
+            render(index - 1);
+          }
+        };
+
+        window.addEventListener('wheel', (event) => {
+          handleScroll(event.deltaY, event);
+        }, { passive: false });
+        window.addEventListener('touchstart', (event) => {
+          touchStartY = event.touches[0]?.clientY ?? 0;
+        }, { passive: true });
+        window.addEventListener('touchmove', (event) => {
+          const currentY = event.touches[0]?.clientY;
+          if (currentY === undefined) return;
+          const deltaY = touchStartY - currentY;
+          if (Math.abs(deltaY) >= 40) handleScroll(deltaY, event);
+        }, { passive: false });
+        window.addEventListener('keydown', (event) => {
+          if (event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
+          const target = event.target;
+          if (target instanceof HTMLElement && target.closest('a, button, input, textarea, select')) return;
+          const bounds = section.getBoundingClientRect();
+          const headerHeight = document.querySelector('.topbar')?.getBoundingClientRect().height ?? 0;
+          if (bounds.top > headerHeight + 40 || bounds.bottom < window.innerHeight - 40) return;
+          const forward = event.key === 'ArrowDown' || event.key === 'PageDown' || event.key === ' ';
+          const backward = event.key === 'ArrowUp' || event.key === 'PageUp';
+          if (forward && index < stories.length - 1) {
+            event.preventDefault();
+            lastChange = performance.now();
+            render(index + 1);
+          } else if (backward && index > 0) {
+            event.preventDefault();
+            lastChange = performance.now();
+            render(index - 1);
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

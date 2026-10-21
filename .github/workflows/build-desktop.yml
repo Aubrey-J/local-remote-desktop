@@ -2,6 +2,10 @@ name: Build desktop apps
 
 on:
   push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
 
@@ -48,6 +52,7 @@ jobs:
             file \
             libfuse2 \
             wget \
+            libayatana-appindicator3-dev \
             libgtk-3-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
@@ -99,3 +104,28 @@ jobs:
           path: src-tauri/target/release/bundle/
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download platform installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Lantern ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/lantern-linux/**/*.deb
+            release-assets/lantern-linux/**/*.AppImage
+            release-assets/lantern-windows/**/*.exe
+            release-assets/lantern-macos/**/*.dmg

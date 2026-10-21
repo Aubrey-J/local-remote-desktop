@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "./App.css";
 
 type Device = {
@@ -26,6 +28,7 @@ type TrustedDevice = { ipAddress: string };
 type DeviceLayout = "grid" | "tile" | "list";
 type FileOffer = { transferId: string; fileName: string; size: number };
 type ClipboardOffer = { text: string };
+type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => void };
 
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
 
@@ -115,6 +118,7 @@ function isLanHost(host: string) {
 }
 
 function App() {
+  const standaloneDeviceId = new URLSearchParams(window.location.search).get("remoteDevice");
   const [savedState] = useState(readDevices);
   const [devices, setDevices] = useState<Device[]>(savedState.devices);
   const [storageError, setStorageError] = useState(savedState.error);
@@ -135,6 +139,9 @@ function App() {
   const [isLoadingLocalInfo, setIsLoadingLocalInfo] = useState(false);
   const [copyAddressStatus, setCopyAddressStatus] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [closeToTray, setCloseToTray] = useState(true);
+  const [closeToTrayError, setCloseToTrayError] = useState("");
+  const [savingCloseToTray, setSavingCloseToTray] = useState(false);
   const [deviceLayout, setDeviceLayout] = useState<DeviceLayout>(() => {
     try {
       return readDeviceLayout();
@@ -179,7 +186,34 @@ function App() {
   const [connectionError, setConnectionError] = useState("");
   const [encoderStatus, setEncoderStatus] = useState("");
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 });
-  const [isRemoteFullscreen, setIsRemoteFullscreen] = useState(false);
+  const [isDomFullscreen, setIsDomFullscreen] = useState(false);
+  const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
+  const isRemoteFullscreen = isDomFullscreen || isNativeFullscreen;
+  const [keyboardLockWarning, setKeyboardLockWarning] = useState("");
+  const standaloneConnectionStarted = useRef(false);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void invoke<boolean>("get_close_to_tray")
+      .then(setCloseToTray)
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setCloseToTrayError(`无法读取关闭窗口设置：${detail}`);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (!standaloneDeviceId || standaloneConnectionStarted.current) return;
+    const device = devices.find((item) => item.id === standaloneDeviceId);
+    if (!device) return;
+    standaloneConnectionStarted.current = true;
+    setActiveId(device.id);
+    connectToDevice(device);
+  }, [devices, standaloneDeviceId]);
+
+  useEffect(() => {
+    if (!standaloneDeviceId && deviceLayout === "list" && connectionDeviceId) disconnectFromDevice();
+  }, [deviceLayout, standaloneDeviceId]);
 
   useEffect(() => {
     if (!hasMounted.current) {
@@ -245,7 +279,8 @@ function App() {
             .catch((cause: unknown) => {
               const detail = cause instanceof Error ? cause.message : String(cause);
               setTransferStatus(`无法写入剪贴板：${detail}`);
-            });
+            })
+            .finally(restoreRemoteFocus);
         } else {
           setPendingClipboardOffer(event.payload);
         }
@@ -316,10 +351,18 @@ function App() {
 
   useEffect(() => {
     const updateFullscreenState = () => {
-      setIsRemoteFullscreen(document.fullscreenElement === viewerRef.current);
+      const isFullscreen = document.fullscreenElement === viewerRef.current;
+      setIsDomFullscreen(isFullscreen);
+      if (!isFullscreen) {
+        (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard?.unlock();
+        setKeyboardLockWarning("");
+      }
     };
     document.addEventListener("fullscreenchange", updateFullscreenState);
-    return () => document.removeEventListener("fullscreenchange", updateFullscreenState);
+    return () => {
+      document.removeEventListener("fullscreenchange", updateFullscreenState);
+      (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard?.unlock();
+    };
   }, []);
 
   useEffect(() => {
@@ -332,6 +375,57 @@ function App() {
       });
     }
   }, [connectionStatus]);
+
+  useEffect(() => {
+    if (connectionStatus !== "connected") return;
+    const releaseRemoteKeys = () => sendInput({ type: "release_all" });
+    const onKey = (event: KeyboardEvent) => {
+      if (
+        event.isComposing ||
+        isAdding ||
+        showSettings ||
+        pendingRequest ||
+        pendingClipboardOffer ||
+        pendingFileOffer ||
+        pendingRemoval
+      ) return;
+      if (
+        (event.altKey && (event.key === "Tab" || event.key === "F4")) ||
+        (event.metaKey && ["Tab", "q", "w", "h", "m"].includes(event.key.toLowerCase())) ||
+        (event.ctrlKey && event.key === "Tab")
+      ) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        target.closest("input, textarea, select, button, a, [contenteditable='true'], [role='dialog']")
+      ) return;
+      event.preventDefault();
+      event.stopPropagation();
+      sendInput({
+        type: "key",
+        code: event.code,
+        key: event.key,
+        down: event.type === "keydown",
+      });
+    };
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", onKey, true);
+    window.addEventListener("blur", releaseRemoteKeys);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keyup", onKey, true);
+      window.removeEventListener("blur", releaseRemoteKeys);
+      releaseRemoteKeys();
+    };
+  }, [
+    connectionStatus,
+    isAdding,
+    pendingClipboardOffer,
+    pendingFileOffer,
+    pendingRemoval,
+    pendingRequest,
+    showSettings,
+  ]);
 
   const activeDevice = useMemo(
     () => devices.find((device) => device.id === activeId) ?? null,
@@ -384,12 +478,32 @@ function App() {
     const viewer = viewerRef.current;
     if (!viewer) return;
     try {
+      if (isTauri()) {
+        await getCurrentWindow().setFullscreen(!isNativeFullscreen);
+        setIsNativeFullscreen((current) => !current);
+        setKeyboardLockWarning("");
+        return;
+      }
       if (document.fullscreenElement === viewer) {
         await document.exitFullscreen();
       } else {
+        const keyboard = (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
+        if (keyboard) {
+          try {
+            await keyboard.lock(["Escape"]);
+            setKeyboardLockWarning("");
+          } catch (cause) {
+            const detail = cause instanceof Error ? cause.message : String(cause);
+            setKeyboardLockWarning(`此系统未能锁定 Esc 键，全屏时按 Esc 仍可能退出：${detail}`);
+          }
+        } else {
+          setKeyboardLockWarning("此系统不支持锁定 Esc 键，全屏时按 Esc 仍可能退出。");
+        }
         await viewer.requestFullscreen();
       }
     } catch (cause) {
+      (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard?.unlock();
+      setKeyboardLockWarning("");
       const detail = cause instanceof Error ? cause.message : String(cause);
       setConnectionError(`无法切换全屏显示：${detail}`);
     }
@@ -434,6 +548,53 @@ function App() {
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTrustedDevicesError(`无法读取信任设备：${detail}`);
+    }
+  }
+
+  async function updateCloseToTray(enabled: boolean) {
+    if (!isTauri() || savingCloseToTray) return;
+    setSavingCloseToTray(true);
+    setCloseToTrayError("");
+    try {
+      await invoke("set_close_to_tray", { enabled });
+      setCloseToTray(enabled);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setCloseToTrayError(`无法保存关闭窗口设置：${detail}`);
+    } finally {
+      setSavingCloseToTray(false);
+    }
+  }
+
+  async function openRemoteWindow(device: Device) {
+    if (!isTauri()) {
+      setTransferStatus("独立控制窗口仅可在 Lantern 桌面应用中打开。");
+      return;
+    }
+    try {
+      const label = `remote-${device.id}`;
+      const existing = await WebviewWindow.getByLabel(label);
+      if (existing) {
+        await existing.show();
+        await existing.setFocus();
+        return;
+      }
+      if (connectionDeviceId === device.id) disconnectFromDevice();
+      const remoteWindow = new WebviewWindow(label, {
+        url: `index.html?remoteDevice=${encodeURIComponent(device.id)}`,
+        title: `Lantern · ${device.name}`,
+        width: 1280,
+        height: 820,
+        minWidth: 760,
+        minHeight: 480,
+        resizable: true,
+      });
+      remoteWindow.once("tauri://error", (event) => {
+        setTransferStatus(`无法打开独立控制窗口：${String(event.payload)}`);
+      });
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法打开独立控制窗口：${detail}`);
     }
   }
 
@@ -582,9 +743,6 @@ function App() {
           } else {
             pendingRemoteCandidatesRef.current.push(candidate);
           }
-        } else if (message.type === "connected") {
-          setConnectionStatus("connected");
-          window.setTimeout(() => viewerRef.current?.focus(), 0);
         } else if (message.type === "encoder_status" && message.status) {
           setEncoderStatus(message.status);
         } else if (message.type === "file_transfer_decision" && message.transfer_id) {
@@ -651,9 +809,18 @@ function App() {
 
     const controlChannel = peer.createDataChannel("control");
     controlChannelRef.current = controlChannel;
+    const markControlConnected = () => {
+      if (
+        peerConnectionRef.current === peer &&
+        peer.connectionState === "connected" &&
+        controlChannel.readyState === "open"
+      ) {
+        setConnectionStatus("connected");
+        window.setTimeout(() => viewerRef.current?.focus({ preventScroll: true }), 0);
+      }
+    };
     controlChannel.onopen = () => {
-      if (peerConnectionRef.current !== peer) return;
-      if (peer.connectionState === "connected") setConnectionStatus("connected");
+      markControlConnected();
     };
     controlChannel.onerror = () => {
       if (peerConnectionRef.current !== peer) return;
@@ -695,8 +862,7 @@ function App() {
     peer.onconnectionstatechange = () => {
       if (peerConnectionRef.current !== peer) return;
       if (peer.connectionState === "connected") {
-        setConnectionStatus("connected");
-        window.setTimeout(() => viewerRef.current?.focus(), 0);
+        markControlConnected();
       } else if (peer.connectionState === "failed") {
         setConnectionStatus("error");
         setConnectionError("WebRTC 媒体连接失败。请检查两台设备间的 UDP 防火墙设置。");
@@ -777,20 +943,25 @@ function App() {
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTransferStatus(`无法读取剪贴板：${detail}`);
+    } finally {
+      restoreRemoteFocus();
     }
   }
 
   async function answerClipboardOffer(accepted: boolean) {
     const offer = pendingClipboardOffer;
     setPendingClipboardOffer(null);
-    if (!accepted || !offer) return;
     try {
-      await navigator.clipboard.writeText(offer.text);
-      clipboardSessionAllowedRef.current = true;
-      setTransferStatus("已将文本写入本机剪贴板；本次连接后续剪贴板接收将自动允许。");
+      if (accepted && offer) {
+        await navigator.clipboard.writeText(offer.text);
+        clipboardSessionAllowedRef.current = true;
+        setTransferStatus("已将文本写入本机剪贴板；本次连接后续剪贴板接收将自动允许。");
+      }
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTransferStatus(`无法写入剪贴板：${detail}`);
+    } finally {
+      restoreRemoteFocus();
     }
   }
 
@@ -807,6 +978,8 @@ function App() {
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTransferStatus(`无法处理文件请求：${detail}`);
+    } finally {
+      restoreRemoteFocus();
     }
   }
 
@@ -861,6 +1034,14 @@ function App() {
     }
   }
 
+  function restoreRemoteFocus() {
+    window.requestAnimationFrame(() => {
+      if (controlChannelRef.current?.readyState === "open") {
+        viewerRef.current?.focus({ preventScroll: true });
+      }
+    });
+  }
+
   function sendMouseMove(event: React.MouseEvent<HTMLDivElement>) {
     const now = performance.now();
     if (now - lastPointerMove.current < 32) return;
@@ -884,13 +1065,8 @@ function App() {
     sendInput({ type: "mouse_button", button, down });
   }
 
-  function sendKey(event: React.KeyboardEvent<HTMLDivElement>, down: boolean) {
-    event.preventDefault();
-    sendInput({ type: "key", code: event.code, key: event.key, down });
-  }
-
   return (
-    <main className="app-shell">
+    <main className={`app-shell${standaloneDeviceId ? " standalone-mode" : ""}${isNativeFullscreen ? " native-remote-fullscreen" : ""}`}>
       <aside className="sidebar">
         <div className="brand" aria-label="Lantern">
           <span className="brand-mark" aria-hidden="true">
@@ -1031,6 +1207,18 @@ function App() {
         </header>
 
         <div className="workspace">
+          {standaloneDeviceId && (
+            <div className="remote-window-heading">
+              <div>
+                <div className="eyebrow"><span /> REMOTE DESKTOP</div>
+                <h1>{devices.find((device) => device.id === standaloneDeviceId)?.name ?? "远程控制"}</h1>
+              </div>
+              <span className="remote-window-status">
+                <span className={connectionStatus === "connected" ? "lan-status-dot" : "offline-dot"} />
+                {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待被控端批准" : connectionStatus === "error" ? "连接失败" : "正在连接"}
+              </span>
+            </div>
+          )}
           <div className="page-heading">
             <div>
               <div className="eyebrow"><span /> LOCAL WORKSPACE</div>
@@ -1127,7 +1315,7 @@ function App() {
             <div className={`device-grid layout-${deviceLayout}`}>
               {devices.map((device, index) => (
                 <article
-                  className={`device-card${device.id === activeId ? " card-active" : ""}`}
+                  className={`device-card${device.id === activeId ? " card-active" : ""}${device.id === standaloneDeviceId ? " standalone-device-card" : ""}`}
                   key={device.id}
                 >
                   {connectionDeviceId === device.id && connectionStatus === "connected" ? (
@@ -1139,8 +1327,6 @@ function App() {
                       tabIndex={0}
                       onContextMenu={(event) => event.preventDefault()}
                       onBlur={() => sendInput({ type: "release_all" })}
-                      onKeyDown={(event) => sendKey(event, true)}
-                      onKeyUp={(event) => sendKey(event, false)}
                       onMouseDown={(event) => sendMouseButton(event, true)}
                       onMouseLeave={() => {
                         sendInput({ type: "mouse_button", button: "left", down: false });
@@ -1172,7 +1358,10 @@ function App() {
                       />
                       <span className="remote-live">
                         <span className="lan-status-dot" />
-                        WebRTC · {encoderStatus || "编码器检测中"} · 点击后键鼠可控
+                        WebRTC · {encoderStatus || "编码器检测中"} · 鼠标和键盘可控
+                        {isRemoteFullscreen && keyboardLockWarning && (
+                          <span className="fullscreen-key-warning" title={keyboardLockWarning}>{keyboardLockWarning}</span>
+                        )}
                       </span>
                       <div
                         className="remote-toolbar"
@@ -1248,7 +1437,7 @@ function App() {
                     className="visually-hidden"
                     type="file"
                     onChange={(event) => {
-                      void selectFile(event.currentTarget.files?.[0]);
+                      void selectFile(event.currentTarget.files?.[0]).finally(restoreRemoteFocus);
                       event.currentTarget.value = "";
                     }}
                   />
@@ -1259,7 +1448,15 @@ function App() {
                       <strong>{device.name}</strong>
                       <span>{device.address}</span>
                     </span>
-                    {connectionDeviceId === device.id && connectionStatus !== "idle" ? (
+                    {deviceLayout === "list" && !standaloneDeviceId ? (
+                      <button
+                        className="connect-button"
+                        type="button"
+                        onClick={() => void openRemoteWindow(device)}
+                      >
+                        打开控制窗口
+                      </button>
+                    ) : connectionDeviceId === device.id && connectionStatus !== "idle" ? (
                       <button
                         className="connect-button connect-button-muted"
                         type="button"
@@ -1466,6 +1663,38 @@ function App() {
                 <small>控制端需主动发送；接收端首次确认后，本次连接内的后续文本将自动写入，断开后重新询问。</small>
               </span>
             </label>
+            <fieldset className="quality-options close-behavior-options">
+              <legend>关闭窗口时</legend>
+              <label className={closeToTray ? "quality-option selected" : "quality-option"}>
+                <input
+                  checked={closeToTray}
+                  disabled={savingCloseToTray}
+                  name="close-behavior"
+                  onChange={() => void updateCloseToTray(true)}
+                  type="radio"
+                  value="tray"
+                />
+                <span>
+                  <strong>最小化到系统托盘</strong>
+                  <small>远程服务继续运行，可从托盘菜单重新打开或退出。</small>
+                </span>
+              </label>
+              <label className={!closeToTray ? "quality-option selected" : "quality-option"}>
+                <input
+                  checked={!closeToTray}
+                  disabled={savingCloseToTray}
+                  name="close-behavior"
+                  onChange={() => void updateCloseToTray(false)}
+                  type="radio"
+                  value="quit"
+                />
+                <span>
+                  <strong>彻底退出应用</strong>
+                  <small>关闭窗口时退出 Lantern，并停止被控端服务。</small>
+                </span>
+              </label>
+              {closeToTrayError && <p className="form-error" role="alert">{closeToTrayError}</p>}
+            </fieldset>
             <section className="trusted-devices-section">
               <h3>信任设备</h3>
               <p>信任后，同一 IP 的连接请求将自动获批。仅信任你控制的设备。</p>
