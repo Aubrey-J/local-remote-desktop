@@ -54,6 +54,25 @@ enum VideoQuality {
     Smooth,
 }
 
+#[tauri::command]
+pub fn send_agent_clipboard(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    text: String,
+) -> Result<(), String> {
+    if text.len() > MAX_CLIPBOARD_TEXT_SIZE {
+        return Err("剪贴板内容超过 48 KiB，未发送。".to_string());
+    }
+    let sender = remote
+        .clipboard_sender
+        .lock()
+        .map_err(|_| "剪贴板发送状态不可用".to_string())?
+        .clone()
+        .ok_or_else(|| "控制端未启用剪贴板共享，或当前没有可用连接。".to_string())?;
+    sender
+        .send(text)
+        .map_err(|_| "剪贴板发送通道已关闭，请重新连接后重试。".to_string())
+}
+
 impl VideoQuality {
     fn settings(self) -> VideoSettings {
         match self {
@@ -93,6 +112,7 @@ pub struct RemoteState {
     pending_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
     pending_request: Mutex<Option<ConnectionRequest>>,
     pending_file_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
+    clipboard_sender: Mutex<Option<mpsc::UnboundedSender<String>>>,
     webrtc_factory: Mutex<Option<Arc<PeerConnectionFactory>>>,
     active_connection: AtomicBool,
     stopping: AtomicBool,
@@ -209,6 +229,16 @@ pub struct FileTransferOffer {
 #[serde(rename_all = "camelCase")]
 pub struct ClipboardOffer {
     text: String,
+}
+
+struct ClipboardSenderGuard(Arc<RemoteState>);
+
+impl Drop for ClipboardSenderGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sender) = self.0.clipboard_sender.lock() {
+            sender.take();
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -686,6 +716,7 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         }
     };
 
+    let _ = state.app.emit("agent-connection-state", false);
     state
         .remote
         .active_connection
@@ -989,6 +1020,15 @@ async fn run_webrtc_session(
 
     let mut capture_worker = CaptureWorker::new();
     let mut stats_worker = StatsWorker::new();
+    let (clipboard_sender, mut clipboard_receiver) = mpsc::unbounded_channel();
+    if clipboard_enabled {
+        *state
+            .remote
+            .clipboard_sender
+            .lock()
+            .map_err(|_| "剪贴板发送状态不可用".to_string())? = Some(clipboard_sender);
+    }
+    let _clipboard_sender_guard = ClipboardSenderGuard(Arc::clone(&state.remote));
 
     loop {
         tokio::select! {
@@ -1078,6 +1118,7 @@ async fn run_webrtc_session(
                         send_signal(socket, serde_json::json!({"type": "connected"}))
                             .await
                             .map_err(|error| format!("发送连接状态失败：{error}"))?;
+                        let _ = state.app.emit("agent-connection-state", true);
                         capture_worker.start(
                             Arc::clone(&video_track),
                             signal_sender.clone(),
@@ -1118,6 +1159,16 @@ async fn run_webrtc_session(
                         .map_err(|error| format!("发送编码器状态失败：{error}"))?;
                     }
                     None => return Err("WebRTC 信令通道已关闭".to_string()),
+                }
+            }
+            text = clipboard_receiver.recv(), if clipboard_enabled => {
+                if let Some(text) = text {
+                    send_signal(socket, serde_json::json!({
+                        "type": "clipboard_offer",
+                        "text": text,
+                    }))
+                    .await
+                    .map_err(|error| format!("发送剪贴板内容失败：{error}"))?;
                 }
             }
             Some(error) = input_error_receiver.recv() => {

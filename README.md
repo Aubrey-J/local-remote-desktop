@@ -11,7 +11,7 @@ Lantern is a LAN-first desktop application for viewing and controlling another c
 
 Added devices can be removed from the three-dot menu on their card; removal requires a second confirmation. The workspace supports grid, tile, and list layouts. In list layout, use **打开控制窗口** to open a separate resizable remote desktop window; it connects independently and supports the same fullscreen control. The desktop app uses native window fullscreen so Escape remains available to the remote computer and does not accidentally leave fullscreen; use the fullscreen button to exit. In browser preview, Lantern attempts to lock Escape, but support depends on the platform WebView and a warning appears if the key cannot be locked. Local OS window-switching/quit shortcuts remain local. The local pointer remains a standard pointer rather than changing to a crosshair. In application settings, a controller IP can be reviewed and removed from the trust list. Trust is optional and only added after the controlled computer approves a request with **信任此控制端** checked; later requests from that IP are automatically approved, so only trust devices on a network you control.
 
-Clipboard sharing is opt-in in settings and is manual: the controller must click the clipboard action. The receiving user approves the first clipboard update in each connection; after approval, later updates are written automatically until disconnect. Each new connection asks again. File transfers also require approval on the receiving computer, are limited to 100 MiB, and save to the Downloads/Lantern Received folder without overwriting existing files.
+Clipboard sharing is opt-in in settings and initiated manually. The controller can send its clipboard from the remote toolbar; while connected, the controlled computer can use **发送本机剪贴板** to send text back. The receiving user approves the first clipboard update in each connection; after approval, later updates are written automatically until disconnect. Each new connection asks again. When a connection, clipboard, or file approval is waiting, Lantern shows and focuses its main window so the prompt is visible. File transfers also require approval on the receiving computer, are limited to 100 MiB, and save to the Downloads/Lantern Received folder without overwriting existing files.
 
 Screen video is sent over a direct WebRTC media connection. In application settings, choose quality-first (up to 2560 pixels wide, 8–20 Mbps), balanced (up to 1920 pixels wide, 4–12 Mbps), or smoothness-first (up to 1600 pixels wide, 16 ms capture interval and 3–12 Mbps). These are target limits; actual frame rate, resolution, and bitrate depend on the controlled display, hardware, and network. The selected mode applies when starting a new connection. Keyboard and mouse input use a WebRTC data channel; the WebSocket on TCP port `4200` is retained for approval and connection signaling. The app prefers H.264 when the platform encoder is available and otherwise falls back to WebRTC's software codec. The live view reports the active codec/encoder and whether the encoder reports hardware acceleration. The initial hardware-encoding path uses VideoToolbox on macOS; Windows and Linux currently use software fallback. Multi-monitor selection, audio, device discovery, accounts, and Internet/relay connectivity are not implemented yet.
 
@@ -41,6 +41,14 @@ npm run build
 ```
 
 Tauri's platform prerequisites are required to build desktop bundles. See the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for Windows, macOS, and Linux.
+
+To build a macOS DMG locally, run:
+
+```sh
+npm run build:mac
+```
+
+This uses the Clang runtime archive required by the bundled WebRTC engine and writes the DMG to `src-tauri/target/release/bundle/dmg/`.
 
 ## Cross-platform builds
 

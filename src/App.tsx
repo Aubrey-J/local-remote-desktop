@@ -170,6 +170,7 @@ function App() {
   const connectionRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
+  const pressedRemoteMouseButtonsRef = useRef<Set<string>>(new Set());
   const pendingFileSendsRef = useRef<Map<string, File>>(new Map());
   const clipboardSessionAllowedRef = useRef(false);
   const remoteStreamRef = useRef<MediaStream | null>(null);
@@ -180,6 +181,8 @@ function App() {
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentAddress, setAgentAddress] = useState("");
   const [agentStatus, setAgentStatus] = useState("");
+  const [agentConnected, setAgentConnected] = useState(false);
+  const [agentClipboardStatus, setAgentClipboardStatus] = useState("");
   const [pendingRequest, setPendingRequest] = useState<ConnectionRequest | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<RemoteStatus>("idle");
   const [connectionDeviceId, setConnectionDeviceId] = useState<string | null>(null);
@@ -191,6 +194,7 @@ function App() {
   const isRemoteFullscreen = isDomFullscreen || isNativeFullscreen;
   const [keyboardLockWarning, setKeyboardLockWarning] = useState("");
   const standaloneConnectionStarted = useRef(false);
+  const isMainWindow = !isTauri() || getCurrentWindow().label === "main";
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -255,24 +259,40 @@ function App() {
     let unlistenRequest: (() => void) | undefined;
     let unlistenRequestEnded: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
+    let unlistenAgentConnection: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;
     let unlistenFileOffer: (() => void) | undefined;
     let unlistenFileReceived: (() => void) | undefined;
 
     void Promise.all([
       listen<ConnectionRequest>("remote-connection-request", (event) => {
+        if (!isMainWindow) return;
         setPendingRequest(event.payload);
       }),
       listen<string>("remote-connection-request-ended", (event) => {
+        if (!isMainWindow) return;
         setPendingRequest((current) =>
           current?.requestId === event.payload ? null : current,
         );
       }),
       listen<string>("agent-status", (event) => {
+        if (!isMainWindow) return;
         setAgentStatus(event.payload);
-        if (event.payload === "远程服务已停止") setAgentRunning(false);
+        if (event.payload === "远程服务已停止") {
+          setAgentRunning(false);
+          setAgentConnected(false);
+        }
+      }),
+      listen<boolean>("agent-connection-state", (event) => {
+        if (!isMainWindow) return;
+        setAgentConnected(event.payload);
+        if (!event.payload) {
+          clipboardSessionAllowedRef.current = false;
+          setPendingClipboardOffer(null);
+        }
       }),
       listen<ClipboardOffer>("remote-clipboard-offer", (event) => {
+        if (!isMainWindow) return;
         if (clipboardSessionAllowedRef.current) {
           void navigator.clipboard.writeText(event.payload.text)
             .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
@@ -283,17 +303,24 @@ function App() {
             .finally(restoreRemoteFocus);
         } else {
           setPendingClipboardOffer(event.payload);
+          void focusMainWindow();
         }
       }),
-      listen<FileOffer>("remote-file-offer", (event) => setPendingFileOffer(event.payload)),
+      listen<FileOffer>("remote-file-offer", (event) => {
+        if (!isMainWindow) return;
+        setPendingFileOffer(event.payload);
+        void focusMainWindow();
+      }),
       listen<{ fileName: string; savedPath: string }>("remote-file-received", (event) => {
+        if (!isMainWindow) return;
         setTransferStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
       }),
-    ]).then(([requestListener, requestEndedListener, statusListener, clipboardListener, fileListener, receivedListener]) => {
+    ]).then(([requestListener, requestEndedListener, statusListener, agentConnectionListener, clipboardListener, fileListener, receivedListener]) => {
       if (cancelled) {
         requestListener();
         requestEndedListener();
         statusListener();
+        agentConnectionListener();
         clipboardListener();
         fileListener();
         receivedListener();
@@ -302,6 +329,7 @@ function App() {
       unlistenRequest = requestListener;
       unlistenRequestEnded = requestEndedListener;
       unlistenStatus = statusListener;
+      unlistenAgentConnection = agentConnectionListener;
       unlistenClipboard = clipboardListener;
       unlistenFileOffer = fileListener;
       unlistenFileReceived = receivedListener;
@@ -315,6 +343,7 @@ function App() {
       unlistenRequest?.();
       unlistenRequestEnded?.();
       unlistenStatus?.();
+      unlistenAgentConnection?.();
       unlistenClipboard?.();
       unlistenFileOffer?.();
       unlistenFileReceived?.();
@@ -327,7 +356,11 @@ function App() {
     const pollPendingRequest = () => {
       void invoke<ConnectionRequest | null>("get_pending_connection_request")
         .then((request) => {
-          if (!cancelled) setPendingRequest(request);
+          if (!cancelled) {
+            setPendingRequest((current) =>
+              current?.requestId === request?.requestId ? current : request,
+            );
+          }
         })
         .catch((cause: unknown) => {
           if (cancelled) return;
@@ -341,7 +374,11 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [agentRunning]);
+  }, [agentRunning, isMainWindow]);
+
+  useEffect(() => {
+    if (pendingRequest && isMainWindow) void focusMainWindow();
+  }, [isMainWindow, pendingRequest]);
 
   useEffect(() => () => {
     connectionRef.current?.close();
@@ -628,6 +665,7 @@ function App() {
     try {
       await invoke("stop_agent");
       setAgentRunning(false);
+      setAgentConnected(false);
       setPendingRequest(null);
       setAgentStatus("远程服务已停止");
     } catch (cause) {
@@ -698,6 +736,7 @@ function App() {
           sdpMLineIndex?: number | null;
           transfer_id?: string;
           accepted?: boolean;
+          text?: string;
         };
         try {
           message = JSON.parse(event.data) as typeof message;
@@ -745,6 +784,8 @@ function App() {
           }
         } else if (message.type === "encoder_status" && message.status) {
           setEncoderStatus(message.status);
+        } else if (message.type === "clipboard_offer" && typeof message.text === "string") {
+          void receiveClipboardOffer(message.text);
         } else if (message.type === "file_transfer_decision" && message.transfer_id) {
           const file = pendingFileSendsRef.current.get(message.transfer_id);
           if (!file) return;
@@ -948,6 +989,43 @@ function App() {
     }
   }
 
+  async function sendAgentClipboard() {
+    if (!agentConnected) {
+      setAgentClipboardStatus("当前没有已连接的控制端。");
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
+        setAgentClipboardStatus("剪贴板内容超过 48 KiB，未发送。");
+        return;
+      }
+      await invoke("send_agent_clipboard", { text });
+      setAgentClipboardStatus("已发送剪贴板内容，等待控制端确认。");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentClipboardStatus(`无法发送剪贴板：${detail}`);
+    }
+  }
+
+  async function receiveClipboardOffer(text: string) {
+    const offer = { text };
+    if (clipboardSessionAllowedRef.current) {
+      try {
+        await navigator.clipboard.writeText(text);
+        setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。");
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setTransferStatus(`无法写入剪贴板：${detail}`);
+      } finally {
+        restoreRemoteFocus();
+      }
+    } else {
+      setPendingClipboardOffer(offer);
+      void focusCurrentWindow();
+    }
+  }
+
   async function answerClipboardOffer(accepted: boolean) {
     const offer = pendingClipboardOffer;
     setPendingClipboardOffer(null);
@@ -962,6 +1040,31 @@ function App() {
       setTransferStatus(`无法写入剪贴板：${detail}`);
     } finally {
       restoreRemoteFocus();
+    }
+  }
+
+  async function focusMainWindow() {
+    if (!isTauri()) return;
+    try {
+      const mainWindow = await WebviewWindow.getByLabel("main");
+      if (!mainWindow) throw new Error("主窗口不存在。");
+      await mainWindow.show();
+      await mainWindow.setFocus();
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentStatus(`有待处理的请求，但无法显示主窗口：${detail}`);
+    }
+  }
+
+  async function focusCurrentWindow() {
+    if (!isTauri()) return;
+    try {
+      const currentWindow = getCurrentWindow();
+      await currentWindow.show();
+      await currentWindow.setFocus();
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`有待处理的剪贴板确认，但无法聚焦窗口：${detail}`);
     }
   }
 
@@ -1042,7 +1145,8 @@ function App() {
     });
   }
 
-  function sendMouseMove(event: React.MouseEvent<HTMLDivElement>) {
+  function sendMouseMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.pointerType !== "mouse") return;
     const now = performance.now();
     if (now - lastPointerMove.current < 32) return;
     lastPointerMove.current = now;
@@ -1059,10 +1163,38 @@ function App() {
     });
   }
 
-  function sendMouseButton(event: React.MouseEvent<HTMLDivElement>, down: boolean) {
+  function mouseButtonName(button: number) {
+    if (button === 0) return "left";
+    if (button === 1) return "middle";
+    if (button === 2) return "right";
+    return null;
+  }
+
+  function sendMouseButton(event: React.PointerEvent<HTMLDivElement>, down: boolean) {
+    if (event.pointerType !== "mouse") return;
+    const button = mouseButtonName(event.button);
+    if (!button) return;
     event.preventDefault();
-    const button = event.button === 2 ? "right" : event.button === 1 ? "middle" : "left";
+    event.currentTarget.focus({ preventScroll: true });
+    if (down) {
+      pressedRemoteMouseButtonsRef.current.add(button);
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } else {
+      pressedRemoteMouseButtonsRef.current.delete(button);
+    }
     sendInput({ type: "mouse_button", button, down });
+  }
+
+  function releaseRemoteMouseButtons() {
+    for (const button of pressedRemoteMouseButtonsRef.current) {
+      sendInput({ type: "mouse_button", button, down: false });
+    }
+    pressedRemoteMouseButtonsRef.current.clear();
+  }
+
+  function releaseRemoteInput() {
+    pressedRemoteMouseButtonsRef.current.clear();
+    sendInput({ type: "release_all" });
   }
 
   return (
@@ -1257,8 +1389,14 @@ function App() {
               <span className={agentRunning ? "lan-status-dot" : "offline-dot"} />
               <span>{agentStatus}</span>
               {agentRunning && <code>{agentAddress}</code>}
+              {agentConnected && (
+                <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
+                  发送本机剪贴板
+                </button>
+              )}
             </div>
           )}
+          {agentClipboardStatus && <div className="transfer-status agent-clipboard-status" role="status">{agentClipboardStatus}</div>}
           {connectionStatus === "error" && connectionError && (
             <div className="connection-error" role="alert">
               <span>{connectionError}</span>
@@ -1326,15 +1464,11 @@ function App() {
                       aria-label={`${device.name} 远程桌面，可使用鼠标和键盘控制`}
                       tabIndex={0}
                       onContextMenu={(event) => event.preventDefault()}
-                      onBlur={() => sendInput({ type: "release_all" })}
-                      onMouseDown={(event) => sendMouseButton(event, true)}
-                      onMouseLeave={() => {
-                        sendInput({ type: "mouse_button", button: "left", down: false });
-                        sendInput({ type: "mouse_button", button: "right", down: false });
-                        sendInput({ type: "mouse_button", button: "middle", down: false });
-                      }}
-                      onMouseMove={sendMouseMove}
-                      onMouseUp={(event) => sendMouseButton(event, false)}
+                      onPointerCancel={releaseRemoteMouseButtons}
+                      onPointerDown={(event) => sendMouseButton(event, true)}
+                      onPointerMove={sendMouseMove}
+                      onPointerUp={(event) => sendMouseButton(event, false)}
+                      onBlur={releaseRemoteInput}
                       onWheel={(event) => {
                         event.preventDefault();
                         const scale = event.deltaMode === 1
@@ -1365,15 +1499,16 @@ function App() {
                       </span>
                       <div
                         className="remote-toolbar"
-                        onMouseMove={(event) => event.stopPropagation()}
-                        onMouseUp={(event) => event.stopPropagation()}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onPointerMove={(event) => event.stopPropagation()}
+                        onPointerUp={(event) => event.stopPropagation()}
                       >
                         <button
                           className="icon-button remote-toolbar-button"
                           type="button"
                           aria-label="发送剪贴板"
                           title="发送本机剪贴板"
-                          onMouseDown={(event) => {
+                          onPointerDown={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
                           }}
@@ -1386,7 +1521,7 @@ function App() {
                           type="button"
                           aria-label="发送文件"
                           title="发送文件"
-                          onMouseDown={(event) => {
+                          onPointerDown={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
                           }}
@@ -1399,7 +1534,7 @@ function App() {
                           type="button"
                           aria-label={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
                           title={isRemoteFullscreen ? "退出全屏" : "全屏显示"}
-                          onMouseDown={(event) => {
+                          onPointerDown={(event) => {
                             event.preventDefault();
                             event.stopPropagation();
                           }}
@@ -1655,12 +1790,13 @@ function App() {
             <label className="clipboard-setting">
               <input
                 checked={clipboardEnabled}
+                disabled={connectionStatus !== "idle"}
                 onChange={(event) => setClipboardEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
               <span>
                 <strong>启用手动剪贴板共享</strong>
-                <small>控制端需主动发送；接收端首次确认后，本次连接内的后续文本将自动写入，断开后重新询问。</small>
+                <small>本机作为控制端时，启用后可发送及接收文本；受控端也可主动发送本机剪贴板。接收方首次确认后，本次连接内的后续文本将自动写入，断开后重新询问。设置仅可在断开时修改。</small>
               </span>
             </label>
             <fieldset className="quality-options close-behavior-options">

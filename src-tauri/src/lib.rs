@@ -117,6 +117,7 @@ pub fn run() {
             remote::get_trusted_devices,
             remote::remove_trusted_device,
             remote::answer_file_transfer,
+            remote::send_agent_clipboard,
             get_close_to_tray,
             set_close_to_tray
         ])

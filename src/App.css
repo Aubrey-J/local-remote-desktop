@@ -287,6 +287,8 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .agent-status, .connection-error { display: flex; align-items: center; gap: 9px; margin: -25px 0 30px; padding: 10px 12px; color: #aab2bd; background: #1b1e24; border: 1px solid #2c323b; border-radius: 8px; font-size: 10px; }
 .agent-status-on { color: #bed5aa; background: #1a2118; border-color: #34442b; }
 .agent-status code { margin-left: auto; color: #c5dfa9; font: 10px "DM Mono", monospace; }
+.agent-clipboard-button { flex: 0 0 auto; white-space: nowrap; }
+.agent-clipboard-status { margin: -20px 0 24px; }
 .connection-error { justify-content: space-between; color: #f0aaa3; background: #2b1d1d; border-color: #57302e; }
 .text-button { padding: 3px 6px; color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 10px; }
 .desktop-heading { margin-bottom: 15px; }
