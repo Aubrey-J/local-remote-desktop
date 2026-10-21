@@ -118,6 +118,16 @@ pub fn run() {
             remote::remove_trusted_device,
             remote::answer_file_transfer,
             remote::send_agent_clipboard,
+            remote::get_system_clipboard_text,
+            remote::set_system_clipboard_text,
+            remote::set_clipboard_sync_enabled,
+            remote::begin_agent_file_transfer,
+            remote::send_agent_file_chunk,
+            remote::finish_agent_file_transfer,
+            remote::begin_controller_file_receive,
+            remote::append_controller_file_chunk,
+            remote::finish_controller_file_receive,
+            remote::cancel_controller_file_receive,
             get_close_to_tray,
             set_close_to_tray
         ])

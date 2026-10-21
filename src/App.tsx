@@ -26,8 +26,16 @@ type LocalDeviceInfo = {
 
 type TrustedDevice = { ipAddress: string };
 type DeviceLayout = "grid" | "tile" | "list";
-type FileOffer = { transferId: string; fileName: string; size: number };
+type FileOffer = { transferId: string; fileName: string; size: number; direction: "to-agent" | "from-agent" };
 type ClipboardOffer = { text: string };
+type IncomingFileTransfer = {
+  transferId: string;
+  fileName: string;
+  size: number;
+  receivedBytes: number;
+  writeQueue: Promise<void>;
+  writeError: string | null;
+};
 type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => void };
 
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
@@ -164,6 +172,11 @@ function App() {
   const [pendingClipboardOffer, setPendingClipboardOffer] = useState<ClipboardOffer | null>(null);
   const [transferStatus, setTransferStatus] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const agentFileInputRef = useRef<HTMLInputElement>(null);
+  const incomingFileTransferRef = useRef<IncomingFileTransfer | null>(null);
+  const pendingAgentFileRef = useRef<{ transferId: string; file: File } | null>(null);
+  const lastClipboardTextRef = useRef<string | null>(null);
+  const clipboardReadErrorReportedRef = useRef(false);
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [error, setError] = useState("");
@@ -317,6 +330,47 @@ function App() {
   }, [devices, standaloneDeviceId]);
 
   useEffect(() => {
+    if (!isTauri() || !clipboardEnabled || connectionStatus !== "connected") {
+      lastClipboardTextRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const pollClipboard = async () => {
+      try {
+        const text = await invoke<string>("get_system_clipboard_text");
+        clipboardReadErrorReportedRef.current = false;
+        if (cancelled) return;
+        const previous = lastClipboardTextRef.current;
+        if (previous === null) {
+          lastClipboardTextRef.current = text;
+          return;
+        }
+        if (text === previous) return;
+        const socket = connectionRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
+          setTransferStatus("剪贴板内容超过 48 KiB，未同步。");
+          lastClipboardTextRef.current = text;
+          return;
+        }
+        socket.send(JSON.stringify({ type: "clipboard_text", text }));
+        lastClipboardTextRef.current = text;
+      } catch (cause) {
+        if (cancelled || clipboardReadErrorReportedRef.current) return;
+        clipboardReadErrorReportedRef.current = true;
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setTransferStatus(`无法监视本机剪贴板：${detail}`);
+      }
+    };
+    void pollClipboard();
+    const timer = window.setInterval(() => void pollClipboard(), 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [clipboardEnabled, connectionStatus]);
+
+  useEffect(() => {
     if (!standaloneDeviceId && deviceLayout === "list" && connectionDeviceId) disconnectFromDevice();
   }, [deviceLayout, standaloneDeviceId]);
 
@@ -353,6 +407,15 @@ function App() {
       setStorageError(`无法保存应用偏好：${detail}`);
     }
   }, [deviceLayout, clipboardEnabled]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void invoke("set_clipboard_sync_enabled", { enabled: clipboardEnabled })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setStorageError(`无法设置剪贴板同步：${detail}`);
+      });
+  }, [clipboardEnabled]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -408,13 +471,14 @@ function App() {
         setAgentConnected(event.payload);
         if (!event.payload) {
           clipboardSessionAllowedRef.current = false;
+          pendingAgentFileRef.current = null;
           setPendingClipboardOffer(null);
         }
       }),
       listen<ClipboardOffer>("remote-clipboard-offer", (event) => {
         if (!isMainWindow) return;
         if (clipboardSessionAllowedRef.current) {
-          void navigator.clipboard.writeText(event.payload.text)
+          void invoke("set_system_clipboard_text", { text: event.payload.text })
             .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
             .catch((cause: unknown) => {
               const detail = cause instanceof Error ? cause.message : String(cause);
@@ -426,9 +490,9 @@ function App() {
           void focusMainWindow();
         }
       }),
-      listen<FileOffer>("remote-file-offer", (event) => {
+      listen<Omit<FileOffer, "direction">>("remote-file-offer", (event) => {
         if (!isMainWindow) return;
-        setPendingFileOffer(event.payload);
+        setPendingFileOffer({ ...event.payload, direction: "to-agent" });
         void focusMainWindow();
       }),
       listen<{ fileName: string; savedPath: string }>("remote-file-received", (event) => {
@@ -496,6 +560,60 @@ function App() {
       window.clearInterval(timer);
     };
   }, [agentRunning, isMainWindow]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlistenDecision: (() => void) | undefined;
+    let unlistenStatus: (() => void) | undefined;
+    let unlistenClipboard: (() => void) | undefined;
+    void Promise.all([
+      listen<{ transferId: string; accepted: boolean; error?: string }>(
+        "agent-file-transfer-decision",
+        ({ payload }) => {
+          const pending = pendingAgentFileRef.current;
+          if (!pending || pending.transferId !== payload.transferId) {
+            if (payload.error) setAgentClipboardStatus(payload.error);
+            return;
+          }
+          if (payload.error) {
+            pendingAgentFileRef.current = null;
+            setAgentClipboardStatus(payload.error);
+          } else if (payload.accepted) {
+            void transmitAgentFile(pending.transferId, pending.file);
+          } else {
+            pendingAgentFileRef.current = null;
+            setAgentClipboardStatus(`${pending.file.name}：控制端拒绝接收。`);
+          }
+        },
+      ),
+      listen<string>("agent-file-transfer-status", ({ payload }) => {
+        setAgentClipboardStatus(payload);
+      }),
+      listen<string>("clipboard-status", ({ payload }) => {
+        setAgentClipboardStatus(payload);
+      }),
+    ]).then(([decisionListener, statusListener, clipboardListener]) => {
+      if (cancelled) {
+        decisionListener();
+        statusListener();
+        clipboardListener();
+        return;
+      }
+      unlistenDecision = decisionListener;
+      unlistenStatus = statusListener;
+      unlistenClipboard = clipboardListener;
+    }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentStatus(`无法接收剪贴板或文件传输状态：${detail}`);
+    });
+    return () => {
+      cancelled = true;
+      unlistenDecision?.();
+      unlistenStatus?.();
+      unlistenClipboard?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (pendingRequest && isMainWindow) void focusMainWindow();
@@ -589,6 +707,13 @@ function App() {
     () => devices.find((device) => device.id === activeId) ?? null,
     [activeId, devices],
   );
+  const clipboardSettingLocked =
+    connectionStatus !== "idle" ||
+    agentConnected ||
+    Object.values(standaloneWindowStatuses).some(
+      (status) => status === "opening" || status === "connecting" ||
+        status === "waitingApproval" || status === "connected",
+    );
 
   function addDevice(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -867,6 +992,7 @@ function App() {
       endpoint.hash = "";
 
       const socket = new WebSocket(endpoint);
+      socket.binaryType = "arraybuffer";
       connectionRef.current = socket;
       socket.onopen = () => {
         setConnectionStatus("waitingApproval");
@@ -877,7 +1003,33 @@ function App() {
           clipboard_enabled: clipboardEnabled,
         }));
       };
-      socket.onmessage = (event: MessageEvent<string>) => {
+      socket.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+        if (event.data instanceof ArrayBuffer) {
+          const incoming = incomingFileTransferRef.current;
+          if (!incoming) {
+            setTransferStatus("收到未请求的文件数据，已忽略。");
+            return;
+          }
+          incoming.receivedBytes += event.data.byteLength;
+          if (incoming.receivedBytes > incoming.size) {
+            incomingFileTransferRef.current = null;
+            cancelControllerFileReceive(incoming.transferId);
+            setTransferStatus("收到的文件数据超过声明大小，传输已中止。");
+            socket.close();
+            return;
+          }
+          const chunk = Array.from(new Uint8Array(event.data));
+          incoming.writeQueue = incoming.writeQueue.then(async () => {
+            if (incoming.writeError) return;
+            await invoke("append_controller_file_chunk", {
+              transferId: incoming.transferId,
+              bytes: chunk,
+            });
+          }).catch((cause: unknown) => {
+            incoming.writeError = cause instanceof Error ? cause.message : String(cause);
+          });
+          return;
+        }
         let message: {
           type?: string;
           message?: string;
@@ -889,6 +1041,8 @@ function App() {
           transfer_id?: string;
           accepted?: boolean;
           text?: string;
+          file_name?: string;
+          size?: number;
         };
         try {
           message = JSON.parse(event.data) as typeof message;
@@ -938,6 +1092,32 @@ function App() {
           setEncoderStatus(message.status);
         } else if (message.type === "clipboard_offer" && typeof message.text === "string") {
           void receiveClipboardOffer(message.text);
+        } else if (
+          message.type === "file_offer" &&
+          typeof message.transfer_id === "string" &&
+          typeof message.file_name === "string" &&
+          typeof message.size === "number" &&
+          message.size > 0 &&
+          message.size <= 100 * 1024 * 1024
+        ) {
+          setPendingFileOffer({
+            transferId: message.transfer_id,
+            fileName: message.file_name,
+            size: message.size,
+            direction: "from-agent",
+          });
+          void focusCurrentWindow();
+        } else if (message.type === "file_offer") {
+          if (typeof message.transfer_id === "string") {
+            socket.send(JSON.stringify({
+              type: "file_transfer_decision",
+              transfer_id: message.transfer_id,
+              accepted: false,
+            }));
+          }
+          setTransferStatus("收到无效的文件传输请求，已拒绝。");
+        } else if (message.type === "file_complete" && message.transfer_id) {
+          void finishIncomingAgentFile(socket, message.transfer_id);
         } else if (message.type === "file_transfer_decision" && message.transfer_id) {
           const file = pendingFileSendsRef.current.get(message.transfer_id);
           if (!file) return;
@@ -949,6 +1129,8 @@ function App() {
           }
         } else if (message.type === "file_transfer_complete") {
           setTransferStatus("文件已成功发送。");
+        } else if (message.type === "file_transfer_error" && message.message) {
+          setTransferStatus(message.message);
         } else if (message.type === "clipboard_error" && message.message) {
           setTransferStatus(message.message);
         } else if (message.type === "error") {
@@ -968,6 +1150,11 @@ function App() {
       socket.onclose = () => {
         if (connectionRef.current !== socket) return;
         connectionRef.current = null;
+        const incomingFile = incomingFileTransferRef.current;
+        incomingFileTransferRef.current = null;
+        if (incomingFile) {
+          cancelControllerFileReceive(incomingFile.transferId);
+        }
         clipboardSessionAllowedRef.current = false;
         setPendingClipboardOffer(null);
         controlChannelRef.current?.close();
@@ -1084,6 +1271,11 @@ function App() {
   }
 
   function disconnectFromDevice(closeStandaloneWindow = true) {
+    const incomingFile = incomingFileTransferRef.current;
+    incomingFileTransferRef.current = null;
+    if (incomingFile) {
+      cancelControllerFileReceive(incomingFile.transferId);
+    }
     const socket = connectionRef.current;
     connectionRef.current = null;
     if (socket) {
@@ -1138,12 +1330,13 @@ function App() {
       return;
     }
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await invoke<string>("get_system_clipboard_text");
       if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
         setTransferStatus("剪贴板内容超过 48 KiB，未发送。");
         return;
       }
       socket.send(JSON.stringify({ type: "clipboard_text", text }));
+      lastClipboardTextRef.current = text;
       setTransferStatus("已发送剪贴板内容，等待对端确认。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
@@ -1159,7 +1352,7 @@ function App() {
       return;
     }
     try {
-      const text = await navigator.clipboard.readText();
+      const text = await invoke<string>("get_system_clipboard_text");
       if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
         setAgentClipboardStatus("剪贴板内容超过 48 KiB，未发送。");
         return;
@@ -1176,7 +1369,8 @@ function App() {
     const offer = { text };
     if (clipboardSessionAllowedRef.current) {
       try {
-        await navigator.clipboard.writeText(text);
+        await invoke("set_system_clipboard_text", { text });
+        lastClipboardTextRef.current = text;
         setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。");
       } catch (cause) {
         const detail = cause instanceof Error ? cause.message : String(cause);
@@ -1195,7 +1389,8 @@ function App() {
     setPendingClipboardOffer(null);
     try {
       if (accepted && offer) {
-        await navigator.clipboard.writeText(offer.text);
+        await invoke("set_system_clipboard_text", { text: offer.text });
+        lastClipboardTextRef.current = offer.text;
         clipboardSessionAllowedRef.current = true;
         setTransferStatus("已将文本写入本机剪贴板；本次连接后续剪贴板接收将自动允许。");
       }
@@ -1241,10 +1436,44 @@ function App() {
     setPendingFileOffer(null);
     if (!offer) return;
     try {
-      await invoke("answer_file_transfer", {
-        transferId: offer.transferId,
-        accepted,
-      });
+      if (offer.direction === "from-agent") {
+        const socket = connectionRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("控制连接已关闭。");
+        if (accepted) {
+          try {
+            await invoke("begin_controller_file_receive", {
+              transferId: offer.transferId,
+              fileName: offer.fileName,
+              size: offer.size,
+            });
+            incomingFileTransferRef.current = {
+              transferId: offer.transferId,
+              fileName: offer.fileName,
+              size: offer.size,
+              receivedBytes: 0,
+              writeQueue: Promise.resolve(),
+              writeError: null,
+            };
+          } catch (cause) {
+            socket.send(JSON.stringify({
+              type: "file_transfer_decision",
+              transfer_id: offer.transferId,
+              accepted: false,
+            }));
+            throw cause;
+          }
+        }
+        socket.send(JSON.stringify({
+          type: "file_transfer_decision",
+          transfer_id: offer.transferId,
+          accepted,
+        }));
+      } else {
+        await invoke("answer_file_transfer", {
+          transferId: offer.transferId,
+          accepted,
+        });
+      }
       setTransferStatus(accepted ? `正在接收 ${offer.fileName}…` : `已拒绝接收 ${offer.fileName}。`);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
@@ -1296,6 +1525,83 @@ function App() {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTransferStatus(`文件发送失败：${detail}`);
     }
+  }
+
+  async function selectAgentFile(file: File | undefined) {
+    if (!file || !agentConnected) return;
+    if (pendingAgentFileRef.current) {
+      setAgentClipboardStatus("已有文件正在等待发送或传输，请完成后再试。");
+      return;
+    }
+    const transferId = crypto.randomUUID();
+    pendingAgentFileRef.current = { transferId, file };
+    try {
+      await invoke("begin_agent_file_transfer", {
+        transferId,
+        fileName: file.name,
+        size: file.size,
+      });
+      setAgentClipboardStatus(`已请求发送 ${file.name}，等待控制端批准。`);
+    } catch (cause) {
+      if (pendingAgentFileRef.current?.transferId === transferId) {
+        pendingAgentFileRef.current = null;
+      }
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentClipboardStatus(`无法发送文件：${detail}`);
+    }
+  }
+
+  async function transmitAgentFile(transferId: string, file: File) {
+    try {
+      const chunkSize = 48 * 1024;
+      for (let offset = 0; offset < file.size; offset += chunkSize) {
+        const chunk = new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer());
+        await invoke("send_agent_file_chunk", {
+          transferId,
+          bytes: Array.from(chunk),
+        });
+        setAgentClipboardStatus(`正在发送 ${file.name}：${Math.min(offset + chunk.byteLength, file.size)} / ${file.size} 字节`);
+      }
+      await invoke("finish_agent_file_transfer", { transferId });
+      setAgentClipboardStatus(`已发送 ${file.name}，等待控制端保存完成。`);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setAgentClipboardStatus(`文件发送失败：${detail}`);
+    } finally {
+      pendingAgentFileRef.current = null;
+    }
+  }
+
+  async function finishIncomingAgentFile(socket: WebSocket, transferId: string) {
+    const incoming = incomingFileTransferRef.current;
+    if (!incoming || incoming.transferId !== transferId || incoming.receivedBytes !== incoming.size) {
+      incomingFileTransferRef.current = null;
+      if (incoming) {
+        cancelControllerFileReceive(incoming.transferId);
+      }
+      setTransferStatus("文件传输未完整，无法保存。");
+      return;
+    }
+    incomingFileTransferRef.current = null;
+    try {
+      await incoming.writeQueue;
+      if (incoming.writeError) throw new Error(incoming.writeError);
+      const savedPath = await invoke<string>("finish_controller_file_receive", { transferId });
+      socket.send(JSON.stringify({ type: "file_transfer_complete", transfer_id: transferId }));
+      setTransferStatus(`已接收 ${incoming.fileName}，保存至 ${savedPath}`);
+    } catch (cause) {
+      cancelControllerFileReceive(transferId);
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`接收文件失败：${detail}`);
+    }
+  }
+
+  function cancelControllerFileReceive(transferId: string) {
+    void invoke("cancel_controller_file_receive", { transferId })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setTransferStatus(`无法清理未完成文件：${detail}`);
+      });
   }
 
   function sendInput(message: Record<string, string | number | boolean>) {
@@ -1558,9 +1864,23 @@ function App() {
               <span>{agentStatus}</span>
               {agentRunning && <code>{agentAddress}</code>}
               {agentConnected && (
-                <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
-                  发送本机剪贴板
-                </button>
+                <>
+                  <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
+                    发送本机剪贴板
+                  </button>
+                  <button className="text-button agent-clipboard-button" onClick={() => agentFileInputRef.current?.click()} type="button">
+                    发送文件到控制端
+                  </button>
+                  <input
+                    ref={agentFileInputRef}
+                    className="visually-hidden"
+                    type="file"
+                    onChange={(event) => {
+                      void selectAgentFile(event.currentTarget.files?.[0]);
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </>
               )}
             </div>
           )}
@@ -1999,13 +2319,13 @@ function App() {
             <label className="clipboard-setting">
               <input
                 checked={clipboardEnabled}
-                disabled={connectionStatus !== "idle"}
+                disabled={clipboardSettingLocked}
                 onChange={(event) => setClipboardEnabled(event.currentTarget.checked)}
                 type="checkbox"
               />
               <span>
-                <strong>启用手动剪贴板共享</strong>
-                <small>本机作为控制端时，启用后可发送及接收文本；受控端也可主动发送本机剪贴板。接收方首次确认后，本次连接内的后续文本将自动写入，断开后重新询问。设置仅可在断开时修改。</small>
+                <strong>启用双向自动剪贴板同步</strong>
+                <small>两端都启用后，复制的文本会自动同步。接收方首次确认后，本次连接内后续内容自动写入；断开后重新询问。仍可使用远程工具栏手动发送。</small>
               </span>
             </label>
             <fieldset className="quality-options close-behavior-options">

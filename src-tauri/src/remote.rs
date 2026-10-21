@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use arboard::Clipboard;
 use axum::{
     Router,
     extract::{
@@ -44,6 +45,7 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_FILE_TRANSFER_SIZE: u64 = 100 * 1024 * 1024;
 const MAX_CLIPBOARD_TEXT_SIZE: usize = 48 * 1024;
+const MAX_FILE_CHUNK_SIZE: usize = 48 * 1024;
 
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +54,86 @@ enum VideoQuality {
     #[default]
     Balanced,
     Smooth,
+}
+
+#[tauri::command]
+pub fn set_clipboard_sync_enabled(remote: tauri::State<'_, Arc<RemoteState>>, enabled: bool) {
+    remote
+        .clipboard_sync_enabled
+        .store(enabled, Ordering::Release);
+}
+
+struct ClipboardWatcher {
+    stopping: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ClipboardWatcher {
+    fn start(
+        app: AppHandle,
+        remote: Arc<RemoteState>,
+        sender: mpsc::UnboundedSender<String>,
+    ) -> Self {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stopping_for_thread = Arc::clone(&stopping);
+        let thread = thread::spawn(move || {
+            let mut clipboard = match Clipboard::new() {
+                Ok(clipboard) => clipboard,
+                Err(error) => {
+                    let _ = app.emit("clipboard-status", format!("无法监视系统剪贴板：{error}"));
+                    return;
+                }
+            };
+            let mut watching = false;
+            while !stopping_for_thread.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(400));
+                if !remote.clipboard_sync_enabled.load(Ordering::Acquire) {
+                    watching = false;
+                    continue;
+                }
+                let Ok(text) = clipboard.get_text() else {
+                    continue;
+                };
+                if !watching {
+                    if let Ok(mut last_shared) = remote.clipboard_last_text.lock() {
+                        *last_shared = Some(text);
+                    }
+                    watching = true;
+                    continue;
+                }
+                let changed = match remote.clipboard_last_text.lock() {
+                    Ok(mut last_shared) if last_shared.as_ref() != Some(&text) => {
+                        *last_shared = Some(text.clone());
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(_) => {
+                        let _ = app.emit("clipboard-status", "剪贴板同步状态不可用");
+                        return;
+                    }
+                };
+                if !changed {
+                    continue;
+                }
+                if text.len() <= MAX_CLIPBOARD_TEXT_SIZE && sender.send(text).is_err() {
+                    return;
+                }
+            }
+        });
+        Self {
+            stopping,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for ClipboardWatcher {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[tauri::command]
@@ -71,6 +153,218 @@ pub fn send_agent_clipboard(
     sender
         .send(text)
         .map_err(|_| "剪贴板发送通道已关闭，请重新连接后重试。".to_string())
+}
+
+#[tauri::command]
+pub fn get_system_clipboard_text() -> Result<String, String> {
+    let mut clipboard = Clipboard::new().map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
+    clipboard
+        .get_text()
+        .map_err(|error| format!("无法读取系统剪贴板：{error}"))
+}
+
+#[tauri::command]
+pub fn set_system_clipboard_text(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    text: String,
+) -> Result<(), String> {
+    if text.len() > MAX_CLIPBOARD_TEXT_SIZE {
+        return Err("剪贴板内容超过 48 KiB，未写入。".to_string());
+    }
+    let mut clipboard = Clipboard::new().map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
+    let mut last_text = remote
+        .clipboard_last_text
+        .lock()
+        .map_err(|_| "剪贴板同步状态不可用".to_string())?;
+    clipboard
+        .set_text(text.clone())
+        .map_err(|error| format!("无法写入系统剪贴板：{error}"))?;
+    *last_text = Some(text);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn begin_agent_file_transfer(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+    file_name: String,
+    size: u64,
+) -> Result<(), String> {
+    if transfer_id.is_empty()
+        || transfer_id.len() > 64
+        || file_name.is_empty()
+        || file_name.len() > 255
+        || PathBuf::from(&file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(file_name.as_str())
+        || size == 0
+        || size > MAX_FILE_TRANSFER_SIZE
+    {
+        return Err("文件名或大小无效，文件不能超过 100 MiB。".to_string());
+    }
+    let sender = remote
+        .file_sender
+        .lock()
+        .map_err(|_| "文件传输状态不可用".to_string())?
+        .clone()
+        .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
+    sender
+        .send(AgentFileCommand::Offer {
+            transfer_id: transfer_id.clone(),
+            file_name,
+            size,
+        })
+        .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn send_agent_file_chunk(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    if transfer_id.len() > 64 || bytes.is_empty() || bytes.len() > MAX_FILE_CHUNK_SIZE {
+        return Err("文件数据块无效。".to_string());
+    }
+    let sender = remote
+        .file_sender
+        .lock()
+        .map_err(|_| "文件传输状态不可用".to_string())?
+        .clone()
+        .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
+    sender
+        .send(AgentFileCommand::Chunk { transfer_id, bytes })
+        .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())
+}
+
+#[tauri::command]
+pub fn finish_agent_file_transfer(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let sender = remote
+        .file_sender
+        .lock()
+        .map_err(|_| "文件传输状态不可用".to_string())?
+        .clone()
+        .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
+    sender
+        .send(AgentFileCommand::Complete { transfer_id })
+        .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())
+}
+
+#[tauri::command]
+pub fn begin_controller_file_receive(
+    app: AppHandle,
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+    file_name: String,
+    size: u64,
+) -> Result<(), String> {
+    if transfer_id.is_empty()
+        || transfer_id.len() > 64
+        || file_name.is_empty()
+        || file_name.len() > 255
+        || size == 0
+        || size > MAX_FILE_TRANSFER_SIZE
+    {
+        return Err("文件接收请求无效或超过 100 MiB 限制".to_string());
+    }
+    let mut pending = remote
+        .controller_file_receiver
+        .lock()
+        .map_err(|_| "文件接收状态不可用".to_string())?;
+    if pending.is_some() {
+        return Err("已有文件正在接收。".to_string());
+    }
+    let (file, path) = create_received_file(&app, &file_name)?;
+    *pending = Some(ControllerFileReceiver {
+        transfer_id,
+        file,
+        path,
+        expected_size: size,
+        received_size: 0,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn append_controller_file_chunk(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_FILE_CHUNK_SIZE {
+        return Err("文件数据块无效。".to_string());
+    }
+    let mut pending = remote
+        .controller_file_receiver
+        .lock()
+        .map_err(|_| "文件接收状态不可用".to_string())?;
+    let receiver = pending
+        .as_mut()
+        .filter(|receiver| receiver.transfer_id == transfer_id)
+        .ok_or_else(|| "文件接收请求已过期。".to_string())?;
+    let next_size = receiver.received_size.saturating_add(bytes.len() as u64);
+    if next_size > receiver.expected_size {
+        return Err("收到的文件数据超过声明大小。".to_string());
+    }
+    receiver
+        .file
+        .write_all(&bytes)
+        .map_err(|error| format!("写入接收文件失败：{error}"))?;
+    receiver.received_size = next_size;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn finish_controller_file_receive(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+) -> Result<String, String> {
+    let mut pending = remote
+        .controller_file_receiver
+        .lock()
+        .map_err(|_| "文件接收状态不可用".to_string())?;
+    let receiver = pending
+        .take()
+        .filter(|receiver| receiver.transfer_id == transfer_id)
+        .ok_or_else(|| "文件接收请求已过期。".to_string())?;
+    let path = receiver.path;
+    if receiver.received_size != receiver.expected_size {
+        drop(receiver.file);
+        let _ = fs::remove_file(&path);
+        return Err("文件数据未完整，无法保存。".to_string());
+    }
+    if let Err(error) = receiver.file.sync_all() {
+        drop(receiver.file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("无法完成接收文件写入：{error}"));
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub fn cancel_controller_file_receive(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let mut pending = remote
+        .controller_file_receiver
+        .lock()
+        .map_err(|_| "文件接收状态不可用".to_string())?;
+    if pending
+        .as_ref()
+        .is_some_and(|receiver| receiver.transfer_id == transfer_id)
+        && let Some(receiver) = pending.take()
+    {
+        let path = receiver.path;
+        drop(receiver.file);
+        fs::remove_file(path).map_err(|error| format!("无法清理未完成的接收文件：{error}"))?;
+    }
+    Ok(())
 }
 
 impl VideoQuality {
@@ -113,9 +407,72 @@ pub struct RemoteState {
     pending_request: Mutex<Option<ConnectionRequest>>,
     pending_file_approval: Mutex<Option<(String, oneshot::Sender<bool>)>>,
     clipboard_sender: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    file_sender: Mutex<Option<mpsc::UnboundedSender<AgentFileCommand>>>,
+    clipboard_last_text: Mutex<Option<String>>,
+    clipboard_sync_enabled: AtomicBool,
+    controller_file_receiver: Mutex<Option<ControllerFileReceiver>>,
     webrtc_factory: Mutex<Option<Arc<PeerConnectionFactory>>>,
     active_connection: AtomicBool,
     stopping: AtomicBool,
+}
+
+enum AgentFileCommand {
+    Offer {
+        transfer_id: String,
+        file_name: String,
+        size: u64,
+    },
+    Chunk {
+        transfer_id: String,
+        bytes: Vec<u8>,
+    },
+    Complete {
+        transfer_id: String,
+    },
+}
+
+struct ControllerFileReceiver {
+    transfer_id: String,
+    file: File,
+    path: PathBuf,
+    expected_size: u64,
+    received_size: u64,
+}
+
+struct AgentIncomingFileTransfer {
+    transfer_id: String,
+    file_name: String,
+    expected_size: u64,
+    contents: Vec<u8>,
+    accepted: bool,
+    _approval_guard: PendingFileApprovalGuard,
+}
+
+struct PendingFileApprovalGuard {
+    remote: Arc<RemoteState>,
+    transfer_id: String,
+}
+
+impl Drop for PendingFileApprovalGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.remote.pending_file_approval.lock()
+            && pending
+                .as_ref()
+                .is_some_and(|(transfer_id, _)| transfer_id == &self.transfer_id)
+        {
+            pending.take();
+        }
+    }
+}
+
+struct AgentFileSenderGuard(Arc<RemoteState>);
+
+impl Drop for AgentFileSenderGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sender) = self.0.file_sender.lock() {
+            sender.take();
+        }
+    }
 }
 
 fn local_hostname() -> Result<String, String> {
@@ -200,6 +557,9 @@ enum ClientMessage {
     ClipboardText {
         text: String,
     },
+    FileTransferComplete {
+        transfer_id: String,
+    },
     FileOffer {
         transfer_id: String,
         file_name: String,
@@ -207,6 +567,10 @@ enum ClientMessage {
     },
     FileComplete {
         transfer_id: String,
+    },
+    FileTransferDecision {
+        transfer_id: String,
+        accepted: bool,
     },
 }
 
@@ -1021,6 +1385,15 @@ async fn run_webrtc_session(
     let mut capture_worker = CaptureWorker::new();
     let mut stats_worker = StatsWorker::new();
     let (clipboard_sender, mut clipboard_receiver) = mpsc::unbounded_channel();
+    let _clipboard_watcher = if clipboard_enabled {
+        Some(ClipboardWatcher::start(
+            state.app.clone(),
+            Arc::clone(&state.remote),
+            clipboard_sender.clone(),
+        ))
+    } else {
+        None
+    };
     if clipboard_enabled {
         *state
             .remote
@@ -1029,6 +1402,18 @@ async fn run_webrtc_session(
             .map_err(|_| "剪贴板发送状态不可用".to_string())? = Some(clipboard_sender);
     }
     let _clipboard_sender_guard = ClipboardSenderGuard(Arc::clone(&state.remote));
+    let (file_sender, mut file_receiver) = mpsc::unbounded_channel();
+    *state
+        .remote
+        .file_sender
+        .lock()
+        .map_err(|_| "文件传输状态不可用".to_string())? = Some(file_sender);
+    let _file_sender_guard = AgentFileSenderGuard(Arc::clone(&state.remote));
+    let mut agent_file_transfer: Option<(String, u64, u64, bool)> = None;
+    let mut agent_incoming_file_transfer: Option<AgentIncomingFileTransfer> = None;
+    let mut file_approval_receiver: Option<oneshot::Receiver<bool>> = None;
+    let mut file_approval_deadline = None;
+    let mut file_receive_deadline = None;
 
     loop {
         tokio::select! {
@@ -1048,7 +1433,13 @@ async fn run_webrtc_session(
                             Ok(ClientMessage::Offer { .. }) => {
                                 return Err("控制端重复发送 WebRTC offer".to_string());
                             }
-                            Ok(ClientMessage::ClipboardText { text }) if clipboard_enabled => {
+                            Ok(ClientMessage::ClipboardText { text })
+                                if clipboard_enabled
+                                    && state
+                                        .remote
+                                        .clipboard_sync_enabled
+                                        .load(Ordering::Acquire) =>
+                            {
                                 if text.len() <= MAX_CLIPBOARD_TEXT_SIZE {
                                     state.app.emit("remote-clipboard-offer", ClipboardOffer { text })
                                         .map_err(|error| format!("无法显示剪贴板接收请求：{error}"))?;
@@ -1074,21 +1465,166 @@ async fn run_webrtc_session(
                                 file_name,
                                 size,
                             }) => {
-                                receive_file_transfer(
+                                let valid_offer = !transfer_id.is_empty()
+                                    && transfer_id.len() <= 64
+                                    && !file_name.is_empty()
+                                    && file_name.len() <= 255
+                                    && PathBuf::from(&file_name)
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        == Some(file_name.as_str())
+                                    && size > 0
+                                    && size <= MAX_FILE_TRANSFER_SIZE;
+                                if !valid_offer
+                                    || agent_file_transfer.is_some()
+                                    || agent_incoming_file_transfer.is_some()
+                                {
+                                    send_signal(
+                                        socket,
+                                        serde_json::json!({
+                                            "type": "file_transfer_decision",
+                                            "transfer_id": transfer_id,
+                                            "accepted": false,
+                                        }),
+                                    )
+                                    .await
+                                    .map_err(|error| format!("拒绝并发文件传输失败：{error}"))?;
+                                } else {
+                                    let (sender, receiver) = oneshot::channel();
+                                    {
+                                        let mut pending = state
+                                            .remote
+                                            .pending_file_approval
+                                            .lock()
+                                            .map_err(|_| "文件传输授权状态不可用".to_string())?;
+                                        *pending = Some((transfer_id.clone(), sender));
+                                    }
+                                    let approval_guard = PendingFileApprovalGuard {
+                                        remote: Arc::clone(&state.remote),
+                                        transfer_id: transfer_id.clone(),
+                                    };
+                                    state
+                                        .app
+                                        .emit(
+                                            "remote-file-offer",
+                                            FileTransferOffer {
+                                                transfer_id: transfer_id.clone(),
+                                                file_name: file_name.clone(),
+                                                size,
+                                            },
+                                        )
+                                        .map_err(|error| {
+                                            format!("无法显示文件接收请求：{error}")
+                                        })?;
+                                    agent_incoming_file_transfer =
+                                        Some(AgentIncomingFileTransfer {
+                                            transfer_id,
+                                            file_name,
+                                            expected_size: size,
+                                            contents: Vec::with_capacity(size as usize),
+                                            accepted: false,
+                                            _approval_guard: approval_guard,
+                                        });
+                                    file_approval_receiver = Some(receiver);
+                                    file_approval_deadline = Some(
+                                        tokio::time::Instant::now()
+                                            + Duration::from_secs(90),
+                                    );
+                                }
+                            }
+                            Ok(ClientMessage::FileComplete { transfer_id }) => {
+                                let Some(incoming) = agent_incoming_file_transfer.take() else {
+                                    return Err("收到未请求的文件完成标记".to_string());
+                                };
+                                if !incoming.accepted
+                                    || incoming.transfer_id != transfer_id
+                                    || incoming.contents.len() as u64 != incoming.expected_size
+                                {
+                                    return Err("文件传输完成标记与数据不匹配".to_string());
+                                }
+                                file_receive_deadline = None;
+                                let saved_path =
+                                    save_received_file(&state.app, &incoming.file_name, &incoming.contents)?;
+                                send_signal(
                                     socket,
-                                    state,
-                                    transfer_id,
-                                    file_name,
-                                    size,
-                                    controller_name,
+                                    serde_json::json!({"type": "file_transfer_complete"}),
                                 )
-                                .await?;
+                                .await
+                                .map_err(|error| format!("发送文件完成状态失败：{error}"))?;
+                                state
+                                    .app
+                                    .emit(
+                                        "remote-file-received",
+                                        serde_json::json!({
+                                            "fileName": incoming.file_name,
+                                            "savedPath": saved_path,
+                                            "controllerName": controller_name,
+                                        }),
+                                    )
+                                    .map_err(|error| {
+                                        format!("无法显示文件保存状态：{error}")
+                                    })?;
+                            }
+                            Ok(ClientMessage::FileTransferDecision { transfer_id, accepted }) => {
+                                match agent_file_transfer.as_mut() {
+                                    Some((active_id, _, _, is_accepted)) if *active_id == transfer_id => {
+                                        *is_accepted = accepted;
+                                        state.app.emit(
+                                            "agent-file-transfer-decision",
+                                            serde_json::json!({
+                                                "transferId": transfer_id,
+                                                "accepted": accepted,
+                                            }),
+                                        ).map_err(|error| format!("无法通知文件发送结果：{error}"))?;
+                                        if !accepted {
+                                            agent_file_transfer = None;
+                                        }
+                                    }
+                                    _ => {
+                                        send_signal(socket, serde_json::json!({
+                                            "type": "file_transfer_error",
+                                            "transfer_id": transfer_id,
+                                            "message": "文件传输请求已过期。",
+                                        }))
+                                        .await
+                                        .map_err(|error| format!("发送文件传输错误失败：{error}"))?;
+                                    }
+                                }
+                            }
+                            Ok(ClientMessage::FileTransferComplete { transfer_id }) => {
+                                if agent_file_transfer.as_ref().is_some_and(
+                                    |(active_id, size, sent, accepted)| {
+                                        active_id == &transfer_id && *accepted && size == sent
+                                    },
+                                ) {
+                                    agent_file_transfer = None;
+                                    let _ = state.app.emit(
+                                        "agent-file-transfer-status",
+                                        "文件已成功送达控制端。",
+                                    );
+                                }
                             }
                             _ => return Err("信令通道收到无效消息".to_string()),
                         }
                     }
-                    Some(Ok(Message::Binary(_))) => {
-                        return Err("收到未请求的文件数据".to_string());
+                    Some(Ok(Message::Binary(chunk))) => {
+                        let Some(incoming) = agent_incoming_file_transfer
+                            .as_mut()
+                            .filter(|incoming| incoming.accepted)
+                        else {
+                            return Err("收到未请求的文件数据".to_string());
+                        };
+                        if chunk.is_empty() || chunk.len() > MAX_FILE_CHUNK_SIZE {
+                            return Err("收到无效的文件数据块".to_string());
+                        }
+                        let next_size = incoming.contents.len().saturating_add(chunk.len());
+                        if next_size as u64 > incoming.expected_size {
+                            return Err("文件数据超过声明大小，传输已中止".to_string());
+                        }
+                        incoming.contents.extend_from_slice(&chunk);
+                        file_receive_deadline = Some(
+                            tokio::time::Instant::now() + Duration::from_secs(30),
+                        );
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(error)) => return Err(format!("WebSocket 错误：{error}")),
@@ -1100,6 +1636,74 @@ async fn run_webrtc_session(
                     }
 
                     Some(Ok(_)) => {}
+                }
+            }
+            decision = async {
+                match file_approval_receiver.as_mut() {
+                    Some(receiver) => receiver.await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                file_approval_receiver = None;
+                file_approval_deadline = None;
+                if let Some(incoming) = agent_incoming_file_transfer.as_mut() {
+                    let accepted = decision.unwrap_or(false);
+                    incoming.accepted = accepted;
+                    if accepted {
+                        file_receive_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_secs(30));
+                    }
+                    send_signal(
+                        socket,
+                        serde_json::json!({
+                            "type": "file_transfer_decision",
+                            "transfer_id": incoming.transfer_id,
+                            "accepted": accepted,
+                        }),
+                    )
+                    .await
+                    .map_err(|error| format!("发送文件传输授权失败：{error}"))?;
+                    if !accepted {
+                        agent_incoming_file_transfer = None;
+                    }
+                }
+            }
+            _ = async {
+                match file_approval_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                file_approval_receiver = None;
+                file_approval_deadline = None;
+                if let Some(incoming) = agent_incoming_file_transfer.take() {
+                    send_signal(
+                        socket,
+                        serde_json::json!({
+                            "type": "file_transfer_decision",
+                            "transfer_id": incoming.transfer_id,
+                            "accepted": false,
+                        }),
+                    )
+                    .await
+                    .map_err(|error| format!("发送文件超时拒绝状态失败：{error}"))?;
+                }
+            }
+            _ = async {
+                match file_receive_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                file_receive_deadline = None;
+                if let Some(incoming) = agent_incoming_file_transfer.take() {
+                    send_signal(socket, serde_json::json!({
+                        "type": "file_transfer_error",
+                        "transfer_id": incoming.transfer_id,
+                        "message": "文件传输 30 秒无数据，已超时。",
+                    }))
+                    .await
+                    .map_err(|error| format!("发送文件超时状态失败：{error}"))?;
                 }
             }
             signal = signal_receiver.recv() => {
@@ -1171,6 +1775,65 @@ async fn run_webrtc_session(
                     .map_err(|error| format!("发送剪贴板内容失败：{error}"))?;
                 }
             }
+            file_command = file_receiver.recv() => {
+                match file_command {
+                    Some(AgentFileCommand::Offer { transfer_id, file_name, size }) => {
+                        if agent_file_transfer.is_some() || agent_incoming_file_transfer.is_some() {
+                            state.app.emit("agent-file-transfer-decision", serde_json::json!({
+                                "transferId": transfer_id,
+                                "accepted": false,
+                                "error": "已有文件正在传输。",
+                            })).map_err(|error| format!("无法报告文件传输状态：{error}"))?;
+                            continue;
+                        }
+                        send_signal(socket, serde_json::json!({
+                            "type": "file_offer",
+                            "transfer_id": transfer_id,
+                            "file_name": file_name,
+                            "size": size,
+                        }))
+                        .await
+                        .map_err(|error| format!("发送文件请求失败：{error}"))?;
+                        agent_file_transfer = Some((transfer_id, size, 0, false));
+                    }
+                    Some(AgentFileCommand::Chunk { transfer_id, bytes }) => {
+                        match agent_file_transfer.as_mut() {
+                            Some((active_id, size, sent, true)) if *active_id == transfer_id => {
+                                let next_size = sent.saturating_add(bytes.len() as u64);
+                                if next_size > *size {
+                                    return Err("发送的文件数据超过声明大小".to_string());
+                                }
+                                socket
+                                    .send(Message::Binary(bytes.into()))
+                                    .await
+                                    .map_err(|error| format!("发送文件数据失败：{error}"))?;
+                                *sent = next_size;
+                            }
+                            _ => return Err("文件尚未获准传输或请求已过期".to_string()),
+                        }
+                    }
+                    Some(AgentFileCommand::Complete { transfer_id }) => {
+                        match agent_file_transfer.as_ref() {
+                            Some((active_id, size, sent, true))
+                                if active_id == &transfer_id && sent == size =>
+                            {
+                                send_signal(socket, serde_json::json!({
+                                    "type": "file_complete",
+                                    "transfer_id": transfer_id,
+                                }))
+                                .await
+                                .map_err(|error| format!("发送文件完成信号失败：{error}"))?;
+                                let _ = state.app.emit(
+                                    "agent-file-transfer-status",
+                                    format!("已发送文件，等待接收端完成保存。"),
+                                );
+                            }
+                            _ => return Err("文件未完整发送，传输已取消".to_string()),
+                        }
+                    }
+                    None => return Err("文件传输通道已关闭".to_string()),
+                }
+            }
             Some(error) = input_error_receiver.recv() => {
                 return Err(format!("键鼠控制失败：{error}，请检查被控端的辅助功能权限。"));
             }
@@ -1189,155 +1852,22 @@ async fn run_webrtc_session(
     Ok(())
 }
 
-async fn receive_file_transfer(
-    socket: &mut WebSocket,
-    state: &ServerState,
-    transfer_id: String,
-    file_name: String,
-    size: u64,
-    controller_name: &str,
-) -> Result<(), String> {
-    if transfer_id.len() > 64
-        || file_name.is_empty()
-        || file_name.len() > 255
-        || PathBuf::from(&file_name)
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some(file_name.as_str())
-        || size == 0
-        || size > MAX_FILE_TRANSFER_SIZE
-    {
-        return Err("文件传输请求无效或超过 100 MiB 限制".to_string());
+fn save_received_file(app: &AppHandle, file_name: &str, contents: &[u8]) -> Result<String, String> {
+    let (mut file, path) = create_received_file(app, file_name)?;
+    if let Err(error) = file.write_all(contents) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("写入接收文件失败：{error}"));
     }
-
-    let offer = FileTransferOffer {
-        transfer_id: transfer_id.clone(),
-        file_name: file_name.clone(),
-        size,
-    };
-    let (sender, mut receiver) = oneshot::channel();
-    {
-        let mut pending = state
-            .remote
-            .pending_file_approval
-            .lock()
-            .map_err(|_| "文件传输授权状态不可用".to_string())?;
-        *pending = Some((transfer_id.clone(), sender));
+    if let Err(error) = file.sync_all() {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("无法完成接收文件写入：{error}"));
     }
-    if let Err(error) = state.app.emit("remote-file-offer", offer) {
-        {
-            let mut pending = state
-                .remote
-                .pending_file_approval
-                .lock()
-                .map_err(|_| "文件传输授权状态不可用".to_string())?;
-            if pending.as_ref().is_some_and(|(id, _)| id == &transfer_id) {
-                pending.take();
-            }
-        }
-        return Err(format!("无法显示文件接收请求：{error}"));
-    }
-
-    let accepted = timeout(Duration::from_secs(90), async {
-        loop {
-            tokio::select! {
-                decision = &mut receiver => return Ok::<bool, String>(decision.unwrap_or(false)),
-                message = socket.recv() => {
-                    match message {
-                        Some(Ok(Message::Ping(payload))) => socket
-                            .send(Message::Pong(payload))
-                            .await
-                            .map_err(|error| format!("文件传输等待授权时 WebSocket 出错：{error}"))?,
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return Ok(false),
-                        Some(Ok(_)) => {}
-                    }
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or(Ok(false))?;
-    {
-        let mut pending = state
-            .remote
-            .pending_file_approval
-            .lock()
-            .map_err(|_| "文件传输授权状态不可用".to_string())?;
-        if pending.as_ref().is_some_and(|(id, _)| id == &transfer_id) {
-            pending.take();
-        }
-    }
-    send_signal(
-        socket,
-        serde_json::json!({
-            "type": "file_transfer_decision",
-            "transfer_id": transfer_id,
-            "accepted": accepted,
-        }),
-    )
-    .await
-    .map_err(|error| format!("发送文件传输授权失败：{error}"))?;
-    if !accepted {
-        return Ok(());
-    }
-
-    let mut contents = Vec::with_capacity(size as usize);
-    loop {
-        let incoming = timeout(Duration::from_secs(30), socket.recv())
-            .await
-            .map_err(|_| "文件传输 30 秒无数据，已超时".to_string())?;
-        match incoming {
-            Some(Ok(Message::Binary(chunk))) => {
-                let next_len = contents.len().saturating_add(chunk.len());
-                if next_len as u64 > size {
-                    return Err("文件数据超过声明大小，传输已中止".to_string());
-                }
-                contents.extend_from_slice(&chunk);
-            }
-            Some(Ok(Message::Text(text))) => {
-                let message: ClientMessage = serde_json::from_str(&text)
-                    .map_err(|error| format!("文件传输信令无效：{error}"))?;
-                match message {
-                    ClientMessage::FileComplete {
-                        transfer_id: completed_id,
-                    } if completed_id == transfer_id && contents.len() as u64 == size => {
-                        let saved_path = save_received_file(&state.app, &file_name, &contents)?;
-                        send_signal(
-                            socket,
-                            serde_json::json!({"type": "file_transfer_complete"}),
-                        )
-                        .await
-                        .map_err(|error| format!("发送文件完成状态失败：{error}"))?;
-                        state
-                            .app
-                            .emit(
-                                "remote-file-received",
-                                serde_json::json!({
-                                    "fileName": file_name,
-                                    "savedPath": saved_path,
-                                    "controllerName": controller_name,
-                                }),
-                            )
-                            .map_err(|error| format!("无法显示文件保存状态：{error}"))?;
-                        return Ok(());
-                    }
-                    _ => return Err("文件传输完成标记与数据不匹配".to_string()),
-                }
-            }
-            Some(Ok(Message::Ping(payload))) => socket
-                .send(Message::Pong(payload))
-                .await
-                .map_err(|error| format!("文件传输时 WebSocket 出错：{error}"))?,
-            Some(Ok(Message::Close(_))) | None => {
-                return Err("文件传输期间连接已关闭".to_string());
-            }
-            Some(Err(error)) => return Err(format!("文件传输时 WebSocket 出错：{error}")),
-            Some(Ok(_)) => return Err("收到无效的文件数据".to_string()),
-        }
-    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
-fn save_received_file(app: &AppHandle, file_name: &str, contents: &[u8]) -> Result<String, String> {
+fn create_received_file(app: &AppHandle, file_name: &str) -> Result<(File, PathBuf), String> {
     let mut file_name: String = file_name
         .chars()
         .map(|character| {
@@ -1382,11 +1912,7 @@ fn save_received_file(app: &AppHandle, file_name: &str, contents: &[u8]) -> Resu
             .create_new(true)
             .open(&candidate)
         {
-            Ok(mut file) => {
-                file.write_all(contents)
-                    .map_err(|error| format!("写入接收文件失败：{error}"))?;
-                return Ok(candidate.to_string_lossy().into_owned());
-            }
+            Ok(file) => return Ok((file, candidate)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("无法创建接收文件：{error}")),
         }
@@ -1573,7 +2099,9 @@ fn apply_input(
         ClientMessage::Hello { .. } => {}
         ClientMessage::ClipboardText { .. }
         | ClientMessage::FileOffer { .. }
-        | ClientMessage::FileComplete { .. } => {}
+        | ClientMessage::FileComplete { .. }
+        | ClientMessage::FileTransferComplete { .. }
+        | ClientMessage::FileTransferDecision { .. } => {}
         ClientMessage::ReleaseAll => {
             for key in state.pressed_keys.drain() {
                 enigo
@@ -1792,6 +2320,12 @@ mod tests {
     fn clipboard_and_file_messages_decode_with_expected_fields() {
         assert!(matches!(
             serde_json::from_str::<ClientMessage>(
+                r#"{"type":"clipboard_text","text":"shared text"}"#
+            ),
+            Ok(ClientMessage::ClipboardText { text }) if text == "shared text"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
                 r#"{"type":"hello","device_name":"Lantern","clipboard_enabled":true}"#
             ),
             Ok(ClientMessage::Hello {
@@ -1814,6 +2348,19 @@ mod tests {
                 r#"{"type":"file_complete","transfer_id":"transfer-1"}"#
             ),
             Ok(ClientMessage::FileComplete { transfer_id }) if transfer_id == "transfer-1"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"file_transfer_decision","transfer_id":"transfer-1","accepted":true}"#
+            ),
+            Ok(ClientMessage::FileTransferDecision { transfer_id, accepted: true })
+                if transfer_id == "transfer-1"
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"file_transfer_complete","transfer_id":"transfer-1"}"#
+            ),
+            Ok(ClientMessage::FileTransferComplete { transfer_id }) if transfer_id == "transfer-1"
         ));
     }
 
