@@ -386,6 +386,9 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .preview-content strong { color: #e0e6dd; font-size: 12px; font-weight: 600; }
 .preview-content > span:last-child { color: #a1a99e; font-size: 10px; }
 .preview-resolution { position: absolute; right: 11px; bottom: 10px; color: #8a948b; font: 9px "DM Mono", monospace; }
+.standalone-preview-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; color: #e0e8d9; background: #101319a8; backdrop-filter: blur(5px); }
+.standalone-preview-overlay strong { font-size: 12px; font-weight: 600; }
+.standalone-preview-overlay > span { color: #a8b19f; font-size: 10px; }
 .device-card-footer { display: flex; align-items: center; gap: 10px; padding: 11px 12px; }
 .connect-button { flex: 0 0 auto; padding: 7px 10px; color: #18220f; background: #a6e86c; border: 1px solid #b7f183; border-radius: 6px; cursor: pointer; font-size: 10px; font-weight: 600; }
 .connect-button:hover { filter: brightness(1.06); }

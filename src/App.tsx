@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 import "./App.css";
@@ -31,6 +31,7 @@ type ClipboardOffer = { text: string };
 type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => void };
 
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
+type StandaloneWindowStatus = RemoteStatus | "opening";
 
 const STORAGE_KEY = "lantern.devices";
 const QUALITY_STORAGE_KEY = "lantern.video-quality";
@@ -178,6 +179,7 @@ function App() {
   const lastPointerMove = useRef(0);
   const viewerRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const standaloneClosingRef = useRef(false);
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentAddress, setAgentAddress] = useState("");
   const [agentStatus, setAgentStatus] = useState("");
@@ -186,6 +188,7 @@ function App() {
   const [pendingRequest, setPendingRequest] = useState<ConnectionRequest | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<RemoteStatus>("idle");
   const [connectionDeviceId, setConnectionDeviceId] = useState<string | null>(null);
+  const [standaloneWindowStatuses, setStandaloneWindowStatuses] = useState<Record<string, StandaloneWindowStatus>>({});
   const [connectionError, setConnectionError] = useState("");
   const [encoderStatus, setEncoderStatus] = useState("");
   const [screenSize, setScreenSize] = useState({ width: 0, height: 0 });
@@ -205,6 +208,94 @@ function App() {
         setCloseToTrayError(`无法读取关闭窗口设置：${detail}`);
       });
   }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ deviceId: string; status: StandaloneWindowStatus | "closed" }>(
+      "remote-window-state",
+      ({ payload }) => {
+        if (!isMainWindow) return;
+        const { deviceId, status } = payload;
+        if (status === "closed") {
+          setStandaloneWindowStatuses((current) => {
+            const { [deviceId]: _closed, ...remaining } = current;
+            return remaining;
+          });
+          return;
+        }
+        setStandaloneWindowStatuses((current) => ({ ...current, [deviceId]: status }));
+      },
+    ).then((stopListening) => {
+      if (cancelled) stopListening();
+      else unlisten = stopListening;
+    }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法同步独立控制窗口状态：${detail}`);
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri() || !standaloneDeviceId || standaloneClosingRef.current) return;
+    void emit("remote-window-state", { deviceId: standaloneDeviceId, status: connectionStatus })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setConnectionError(`无法同步独立控制窗口状态：${detail}`);
+      });
+  }, [connectionStatus, standaloneDeviceId]);
+
+  useEffect(() => {
+    if (!isTauri() || !standaloneDeviceId) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ deviceId: string }>("remote-window-status-request", ({ payload }) => {
+      if (payload.deviceId !== standaloneDeviceId) return;
+      void emit("remote-window-state", { deviceId: standaloneDeviceId, status: connectionStatus })
+        .catch((cause: unknown) => {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setConnectionError(`无法同步独立控制窗口状态：${detail}`);
+        });
+    }).then((stopListening) => {
+      if (cancelled) stopListening();
+      else unlisten = stopListening;
+    }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setConnectionError(`无法监听独立窗口状态请求：${detail}`);
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [connectionStatus, standaloneDeviceId]);
+
+  useEffect(() => {
+    if (!isTauri() || !standaloneDeviceId) return;
+    let cancelled = false;
+    let unlistenCloseEvent: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested(() => {
+      standaloneClosingRef.current = true;
+      void emit("remote-window-state", { deviceId: standaloneDeviceId, status: "closed" })
+        .catch((cause: unknown) => {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setConnectionError(`无法同步独立控制窗口关闭状态：${detail}`);
+        });
+    }).then((stopListening) => {
+      if (cancelled) stopListening();
+      else unlistenCloseEvent = stopListening;
+    }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setConnectionError(`无法监听独立窗口关闭状态：${detail}`);
+    });
+    return () => {
+      cancelled = true;
+      unlistenCloseEvent?.();
+    };
+  }, [standaloneDeviceId]);
 
   useEffect(() => {
     const className = "native-fullscreen-document";
@@ -538,6 +629,7 @@ function App() {
     if (connectionDeviceId === id) {
       disconnectFromDevice();
     }
+    if (standaloneWindowStatuses[id]) void closeRemoteWindow(id);
     setActiveId((current) => (current === id ? null : current));
   }
 
@@ -642,11 +734,17 @@ function App() {
       const label = `remote-${device.id}`;
       const existing = await WebviewWindow.getByLabel(label);
       if (existing) {
+        setStandaloneWindowStatuses((current) => ({
+          ...current,
+          [device.id]: current[device.id] ?? "opening",
+        }));
         await existing.show();
         await existing.setFocus();
+        await emit("remote-window-status-request", { deviceId: device.id });
         return;
       }
       if (connectionDeviceId === device.id) disconnectFromDevice();
+      setStandaloneWindowStatuses((current) => ({ ...current, [device.id]: "opening" }));
       const remoteWindow = new WebviewWindow(label, {
         url: `index.html?remoteDevice=${encodeURIComponent(device.id)}`,
         title: `Lantern · ${device.name}`,
@@ -656,12 +754,36 @@ function App() {
         minHeight: 480,
         resizable: true,
       });
+      remoteWindow.once("tauri://destroyed", () => {
+        setStandaloneWindowStatuses((current) => {
+          const { [device.id]: _closed, ...remaining } = current;
+          return remaining;
+        });
+      });
       remoteWindow.once("tauri://error", (event) => {
+        setStandaloneWindowStatuses((current) => {
+          const { [device.id]: _failed, ...remaining } = current;
+          return remaining;
+        });
         setTransferStatus(`无法打开独立控制窗口：${String(event.payload)}`);
       });
     } catch (cause) {
+      setStandaloneWindowStatuses((current) => {
+        const { [device.id]: _failed, ...remaining } = current;
+        return remaining;
+      });
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTransferStatus(`无法打开独立控制窗口：${detail}`);
+    }
+  }
+
+  async function closeRemoteWindow(deviceId: string) {
+    try {
+      const remoteWindow = await WebviewWindow.getByLabel(`remote-${deviceId}`);
+      if (remoteWindow) await remoteWindow.close();
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法关闭独立控制窗口：${detail}`);
     }
   }
 
@@ -729,7 +851,7 @@ function App() {
       setConnectionError("请在 Lantern 桌面应用中使用远程控制；浏览器预览不支持桌面端输入转发。");
       return;
     }
-    disconnectFromDevice();
+    disconnectFromDevice(false);
     setActiveId(device.id);
     setConnectionDeviceId(device.id);
     setConnectionStatus("connecting");
@@ -961,7 +1083,7 @@ function App() {
     }
   }
 
-  function disconnectFromDevice() {
+  function disconnectFromDevice(closeStandaloneWindow = true) {
     const socket = connectionRef.current;
     connectionRef.current = null;
     if (socket) {
@@ -991,6 +1113,18 @@ function App() {
     setConnectionError("");
     setScreenSize({ width: 0, height: 0 });
     setEncoderStatus("");
+    if (standaloneDeviceId && isTauri() && closeStandaloneWindow) {
+      standaloneClosingRef.current = true;
+      void emit("remote-window-state", { deviceId: standaloneDeviceId, status: "closed" })
+        .catch((cause: unknown) => {
+          const detail = cause instanceof Error ? cause.message : String(cause);
+          setConnectionError(`无法同步独立控制窗口状态：${detail}`);
+        });
+      void getCurrentWindow().close().catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setConnectionError(`无法关闭独立控制窗口：${detail}`);
+      });
+    }
   }
 
   async function sendClipboard() {
@@ -1381,7 +1515,7 @@ function App() {
               </div>
               <span className="remote-window-status">
                 <span className={connectionStatus === "connected" ? "lan-status-dot" : "offline-dot"} />
-                {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待被控端批准" : connectionStatus === "error" ? "连接失败" : "正在连接"}
+                {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待被控端批准" : connectionStatus === "error" ? "连接失败" : connectionStatus === "idle" ? "未连接" : "正在连接"}
               </span>
             </div>
           )}
@@ -1434,7 +1568,7 @@ function App() {
           {connectionStatus === "error" && connectionError && (
             <div className="connection-error" role="alert">
               <span>{connectionError}</span>
-              <button className="text-button" onClick={disconnectFromDevice} type="button">关闭</button>
+              <button className="text-button" onClick={() => disconnectFromDevice()} type="button">关闭</button>
             </div>
           )}
 
@@ -1485,12 +1619,27 @@ function App() {
             </div>
           ) : (
             <div className={`device-grid layout-${deviceLayout}`}>
-              {devices.map((device, index) => (
+              {devices.map((device, index) => {
+                const standaloneStatus = standaloneWindowStatuses[device.id];
+                const standaloneStatusLabel = standaloneStatus === "opening"
+                  ? "正在打开独立窗口"
+                  : standaloneStatus === "connected"
+                    ? "独立窗口已连接"
+                    : standaloneStatus === "waitingApproval"
+                      ? "独立窗口等待批准"
+                      : standaloneStatus === "connecting"
+                        ? "独立窗口连接中"
+                        : standaloneStatus === "error"
+                          ? "独立窗口连接失败"
+                          : standaloneStatus === "idle"
+                            ? "独立窗口未连接"
+                            : "";
+                return (
                 <article
                   className={`device-card${device.id === activeId ? " card-active" : ""}${device.id === standaloneDeviceId ? " standalone-device-card" : ""}`}
                   key={device.id}
                 >
-                  {connectionDeviceId === device.id && connectionStatus === "connected" ? (
+                  {connectionDeviceId === device.id && connectionStatus === "connected" && !standaloneStatus ? (
                     <div
                       className={`preview-area remote-preview${standaloneDeviceId ? "" : " remote-preview-readonly"}`}
                       ref={viewerRef}
@@ -1610,6 +1759,12 @@ function App() {
                         <span>{connectionDeviceId === device.id && connectionStatus === "waitingApproval" ? "请在被控端确认连接" : "启动连接以查看屏幕并控制"}</span>
                       </span>
                       <span className="preview-resolution">— × —</span>
+                      {standaloneStatus && (
+                        <span className="standalone-preview-overlay">
+                          <strong>已在独立窗口打开</strong>
+                          <span>{standaloneStatusLabel}</span>
+                        </span>
+                      )}
                     </button>
                   )}
                   <input
@@ -1628,7 +1783,15 @@ function App() {
                       <strong>{device.name}</strong>
                       <span>{device.address}</span>
                     </span>
-                    {deviceLayout === "list" && !standaloneDeviceId ? (
+                    {standaloneStatus && !standaloneDeviceId ? (
+                      <button
+                        className="connect-button connect-button-muted"
+                        type="button"
+                        onClick={() => void closeRemoteWindow(device.id)}
+                      >
+                        {standaloneStatus === "idle" ? "关闭窗口" : "断开"}
+                      </button>
+                    ) : deviceLayout === "list" && !standaloneDeviceId ? (
                       <button
                         className="connect-button"
                         type="button"
@@ -1640,7 +1803,7 @@ function App() {
                       <button
                         className="connect-button connect-button-muted"
                         type="button"
-                        onClick={disconnectFromDevice}
+                        onClick={() => disconnectFromDevice()}
                       >
                         断开
                       </button>
@@ -1691,7 +1854,8 @@ function App() {
                     </div>
                   </div>
                 </article>
-              ))}
+                );
+              })}
             </div>
           )}
 
