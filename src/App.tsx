@@ -292,6 +292,7 @@ function App() {
     let unlistenCloseEvent: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested(() => {
       standaloneClosingRef.current = true;
+      disconnectFromDevice(false);
       void emit("remote-window-state", { deviceId: standaloneDeviceId, status: "closed" })
         .catch((cause: unknown) => {
           const detail = cause instanceof Error ? cause.message : String(cause);
@@ -1819,10 +1820,20 @@ function App() {
                 <div className="eyebrow"><span /> REMOTE DESKTOP</div>
                 <h1>{devices.find((device) => device.id === standaloneDeviceId)?.name ?? "远程控制"}</h1>
               </div>
-              <span className="remote-window-status">
-                <span className={connectionStatus === "connected" ? "lan-status-dot" : "offline-dot"} />
-                {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待被控端批准" : connectionStatus === "error" ? "连接失败" : connectionStatus === "idle" ? "未连接" : "正在连接"}
-              </span>
+              <div className="remote-window-actions">
+                <span className="remote-window-status">
+                  <span className={connectionStatus === "connected" ? "lan-status-dot" : "offline-dot"} />
+                  {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待被控端批准" : connectionStatus === "error" ? "连接失败" : connectionStatus === "idle" ? "未连接" : "正在连接"}
+                </span>
+                <button
+                  className="secondary-button"
+                  onClick={() => disconnectFromDevice()}
+                  type="button"
+                >
+                  <Icon name="close" />
+                  关闭窗口
+                </button>
+              </div>
             </div>
           )}
           <div className="page-heading">

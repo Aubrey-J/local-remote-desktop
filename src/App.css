@@ -50,6 +50,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .standalone-mode .remote-window-heading .eyebrow { margin: 0 0 5px; }
 .standalone-mode .remote-window-heading h1 { margin: 0; font-size: 20px; }
 .standalone-mode .remote-window-status { display: flex; align-items: center; gap: 7px; color: #aab2bd; font-size: 11px; }
+.standalone-mode .remote-window-actions { display: flex; align-items: center; gap: 14px; }
 .standalone-mode .page-heading, .standalone-mode .notice, .standalone-mode .agent-status,
 .standalone-mode .desktop-heading, .standalone-mode .selection-bar, .standalone-mode .workspace-footer { display: none; }
 .standalone-mode .connection-error { margin: 0 0 12px; }
