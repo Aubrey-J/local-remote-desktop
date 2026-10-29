@@ -106,6 +106,11 @@ pub fn run() {
                 if let Err(error) = window.hide() {
                     eprintln!("无法隐藏 Lantern 窗口：{error}");
                 }
+            } else if window.label().starts_with("remote-")
+                && matches!(event, WindowEvent::CloseRequested { .. })
+                && let Err(error) = window.destroy()
+            {
+                eprintln!("无法关闭独立控制窗口：{error}");
             }
         })
         .invoke_handler(tauri::generate_handler![
