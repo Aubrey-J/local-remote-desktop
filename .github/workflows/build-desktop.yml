@@ -63,7 +63,8 @@ jobs:
             libxdo-dev \
             librsvg2-dev \
             libxkbcommon-dev \
-            libwayland-dev
+            libwayland-dev \
+            libpipewire-0.3-dev
 
       - name: Select Linux C++ compiler
         if: runner.os == 'Linux'
@@ -85,6 +86,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Run Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Build and bundle Lantern
         if: runner.os != 'macOS'

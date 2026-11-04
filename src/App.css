@@ -415,6 +415,10 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .remote-preview:focus-visible { outline: 2px solid #a6e86c; outline-offset: -2px; }
 .remote-preview:fullscreen { width: 100vw; height: 100vh; aspect-ratio: auto; padding: 0; border-radius: 0; }
 .remote-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; pointer-events: none; user-select: none; }
+.remote-audio { display: none; }
+.remote-audio-status { position: absolute; z-index: 1; bottom: 8px; left: 9px; display: flex; align-items: center; gap: 8px; max-width: min(60%, 520px); padding: 5px 7px; color: #d2ddca; background: #101319d9; border: 1px solid #ffffff20; border-radius: 5px; font-size: 9px; pointer-events: auto; }
+.remote-audio-status span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-audio-status button { flex: 0 0 auto; padding: 3px 6px; color: #18220f; background: #a6e86c; border: 0; border-radius: 4px; cursor: pointer; font-size: 9px; }
 .remote-live { position: absolute; z-index: 1; right: 9px; bottom: 8px; display: flex; align-items: center; gap: 5px; padding: 5px 7px; color: #d2ddca; background: #101319c9; border: 1px solid #ffffff12; border-radius: 5px; font-size: 8px; pointer-events: none; }
 .fullscreen-key-warning { max-width: min(48vw, 420px); color: #ffd28a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .remote-toolbar { position: absolute; z-index: 2; top: 9px; right: 9px; display: flex; gap: 6px; }
@@ -432,6 +436,24 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .device-menu { position: absolute; z-index: 4; right: 0; bottom: calc(100% + 7px); width: 142px; padding: 4px; background: #20242b; border: 1px solid #3a414c; border-radius: 7px; box-shadow: 0 8px 24px #0008; }
 .device-menu button { width: 100%; padding: 8px 9px; color: #e5b0a9; background: transparent; border: 0; border-radius: 4px; cursor: pointer; text-align: left; font-size: 10px; }
 .device-menu button:hover, .device-menu button:focus-visible { background: #342624; outline: none; }
+.device-menu .menu-edit { color: #d3dae2; }
+.device-menu .menu-edit:hover, .device-menu .menu-edit:focus-visible { background: #2a3038; }
+.device-discovery { display: grid; gap: 7px; margin: 0 0 12px; }
+.device-discovery > .secondary-button { justify-self: start; min-height: 32px; }
+.device-discovery > p { margin: 0; color: #929ba7; font-size: 10px; line-height: 1.5; }
+.discovered-device-list { display: grid; gap: 5px; max-height: 130px; overflow-y: auto; }
+.discovered-device-list button { display: flex; justify-content: space-between; gap: 8px; padding: 8px 9px; color: #d7dde5; background: #191c21; border: 1px solid #303640; border-radius: 6px; cursor: pointer; text-align: left; }
+.discovered-device-list button:hover { background: #242a21; border-color: #536447; }
+.discovered-device-list strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.discovered-device-list span { color: #8d96a3; font: 9px "DM Mono", monospace; white-space: nowrap; }
+.file-transfer-controls { display: flex; align-items: center; gap: 8px; margin: 10px 0; padding: 9px 10px; background: #1b2025; border: 1px solid #343c43; border-radius: 8px; }
+.file-transfer-progress { display: grid; flex: 1; min-width: 0; gap: 4px; }
+.file-transfer-progress strong { overflow: hidden; color: #dfe5ec; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.file-transfer-progress span { color: #8f99a5; font: 9px "DM Mono", monospace; }
+.file-transfer-progress progress { width: 100%; height: 4px; accent-color: #a6e86c; }
+.file-transfer-controls .secondary-button, .transfer-cancel-button { min-height: 30px; padding: 0 9px; font-size: 10px; }
+.transfer-cancel-button { color: #e7b5af; background: #302221; border: 1px solid #65403d; border-radius: 6px; cursor: pointer; }
+.transfer-cancel-button:hover { background: #402a28; }
 .danger-button { min-height: 36px; padding: 0 13px; color: #fff0ee; background: #8e3937; border: 1px solid #ae514c; border-radius: 7px; cursor: pointer; font-size: 11px; font-weight: 600; }
 .danger-button:hover { background: #a24440; }
 .selection-bar { display: flex; align-items: center; gap: 8px; margin-top: 16px; padding: 10px 12px; color: #aab3bf; background: #191c22; border: 1px solid #292e37; border-radius: 8px; font-size: 10px; }
@@ -455,8 +477,32 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .device-dialog input { width: 100%; height: 40px; padding: 0 11px; color: #e3e8ef; background: #111419; border: 1px solid #303641; border-radius: 7px; font-size: 11px; }
 .device-dialog input::placeholder { color: #666f7b; }
 .field-hint { display: block; margin-top: 8px; color: #777f8b; font-size: 9px; }
-.settings-dialog { width: min(100%, 480px); }
-.settings-dialog { max-height: min(90vh, 820px); overflow-y: auto; }
+.settings-dialog { display: grid; grid-template-columns: 190px minmax(0, 1fr); width: min(100%, 760px); height: min(86vh, 620px); max-height: 90vh; padding: 0; overflow: hidden; background: #191c22; border: 1px solid #333944; border-radius: 14px; box-shadow: 0 22px 80px #0008; }
+.settings-sidebar { display: flex; flex-direction: column; padding: 25px 12px 14px; background: #15181d; border-right: 1px solid #2d333d; }
+.settings-sidebar h2 { margin: 0 10px 22px; color: #e8edf1; font: 600 16px "Manrope", sans-serif; }
+.settings-navigation { display: grid; gap: 4px; }
+.settings-navigation-item { min-height: 38px; padding: 0 10px; color: #aab2bd; background: transparent; border: 1px solid transparent; border-radius: 7px; cursor: pointer; text-align: left; font-size: 11px; }
+.settings-navigation-item:hover { color: #e1e6ec; background: #20242b; }
+.settings-navigation-item.selected { color: #d7edc1; background: #252e20; border-color: #3a4b30; }
+.settings-close-button { width: 100%; margin-top: auto; }
+.diagnostic-actions { display: flex; gap: 8px; margin: 14px 0 10px; }
+.diagnostic-actions .secondary-button { min-height: 32px; padding: 0 10px; }
+.diagnostic-log { max-height: 300px; margin: 0; padding: 12px; overflow: auto; color: #b7c1ce; background: #101318; border: 1px solid #303641; border-radius: 7px; font: 10px/1.6 "DM Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.settings-page { position: relative; min-width: 0; overflow-y: auto; }
+.settings-page-content { padding: 30px 30px 24px; }
+.settings-page-content h3 { margin: 0 36px 7px 0; color: #e8edf1; font: 600 16px "Manrope", sans-serif; }
+.settings-page-content > p { margin: 0 36px 20px 0; color: #9099a5; font-size: 10px; line-height: 1.6; }
+.settings-select-label { display: block; margin: 18px 0 7px; color: #c2c9d1; font-size: 11px; font-weight: 600; }
+.settings-select { width: 100%; min-height: 38px; padding: 0 10px; color: #e3e8ef; background: #111419; border: 1px solid #303641; border-radius: 7px; font-size: 11px; }
+.settings-page .dialog-close { position: absolute; z-index: 1; }
+.settings-page .quality-options { margin-top: 20px; }
+.settings-page .trusted-devices-section { margin-top: 0; padding-top: 0; border-top: 0; }
+.settings-guidance { display: grid; gap: 8px; margin-top: 23px; padding: 13px; background: #13161b; border: 1px solid #303641; border-radius: 8px; }
+.settings-guidance h4 { margin: 0 0 2px; color: #dfe5eb; font-size: 11px; }
+.settings-guidance p { margin: 0; color: #8d96a2; font-size: 10px; line-height: 1.55; }
+.settings-guidance strong { color: #c2c9d1; font-weight: 600; }
+.settings-clipboard-setting { padding: 13px; background: #13161b; border: 1px solid #303641; border-radius: 8px; }
+.settings-note { margin: 12px 0 0 !important; color: #d9b979 !important; font-size: 10px !important; }
 .quality-options { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; border: 0; }
 .quality-options legend { margin-bottom: 9px; color: #c2c9d1; font-size: 11px; font-weight: 600; }
 .quality-option { display: flex; align-items: flex-start; gap: 10px; margin: 0; padding: 11px; background: #13161b; border: 1px solid #303641; border-radius: 8px; cursor: pointer; }
@@ -466,9 +512,10 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .quality-option strong { color: #dfe5eb; font-size: 11px; }
 .quality-option small { color: #8d96a2; font-size: 10px; line-height: 1.5; }
 .close-behavior-options { margin-top: 20px; }
-.device-dialog .clipboard-setting, .device-dialog .trust-device-choice { display: flex; align-items: flex-start; gap: 9px; margin: 14px 0; color: #c2c9d1; font-size: 11px; font-weight: 500; cursor: pointer; }
-.device-dialog .clipboard-setting input, .device-dialog .trust-device-choice input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: #a6e86c; }
+.device-dialog .clipboard-setting, .device-dialog .trust-device-choice, .settings-dialog .clipboard-setting { display: flex; align-items: flex-start; gap: 9px; margin: 14px 0; color: #c2c9d1; font-size: 11px; font-weight: 500; cursor: pointer; }
+.device-dialog .clipboard-setting input, .device-dialog .trust-device-choice input, .settings-dialog .clipboard-setting input { width: 15px; height: 15px; flex: 0 0 15px; margin: 1px 0 0; accent-color: #a6e86c; }
 .clipboard-setting > span { display: grid; gap: 4px; }
+.settings-dialog .clipboard-setting strong { color: #dfe5eb; font-size: 11px; }
 .clipboard-setting small { color: #8d96a2; font-size: 10px; line-height: 1.5; }
 .trusted-devices-section { margin-top: 20px; padding-top: 15px; border-top: 1px solid #2d333d; }
 .trusted-devices-section h3 { margin: 0 0 6px; color: #dfe5eb; font-size: 12px; }
@@ -497,4 +544,13 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
   .device-grid { grid-template-columns: 1fr; }
   .device-grid.layout-tile { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .page-heading { align-items: flex-start; flex-direction: column; gap: 16px; }
+}
+@media (max-width: 560px) {
+  .settings-dialog { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); width: min(100%, 460px); height: min(90vh, 720px); }
+  .settings-sidebar { padding: 17px 14px 10px; border-right: 0; border-bottom: 1px solid #2d333d; }
+  .settings-sidebar h2 { margin: 0 4px 12px; }
+  .settings-navigation { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; }
+  .settings-navigation-item { padding: 0 4px; text-align: center; font-size: 9px; }
+  .settings-close-button { display: none; }
+  .settings-page-content { padding: 22px 18px; }
 }

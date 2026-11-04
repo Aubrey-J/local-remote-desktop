@@ -24,9 +24,36 @@ type LocalDeviceInfo = {
   address: string;
 };
 
+type AvailableDisplay = {
+  id: number;
+  name: string;
+  width: number;
+  height: number;
+  primary: boolean;
+};
+
+type DiscoveredDevice = { name: string; address: string };
+
 type TrustedDevice = { ipAddress: string };
 type DeviceLayout = "grid" | "tile" | "list";
-type FileOffer = { transferId: string; fileName: string; size: number; direction: "to-agent" | "from-agent" };
+type FileOffer = {
+  transferId: string;
+  fileName: string;
+  size: number;
+  sha256: string;
+  receivedBytes: number;
+  direction: "to-agent" | "from-agent";
+};
+type ActiveFileTransfer = {
+  transferId: string;
+  fileName: string;
+  size: number;
+  transferred: number;
+  paused: boolean;
+  path: "websocket" | "tauri";
+  mode: "send" | "receive";
+};
+type PendingFileIdentity = { fingerprint: string; transferId: string; updatedAt: number };
 type ClipboardOffer = { text: string };
 type IncomingFileTransfer = {
   transferId: string;
@@ -40,20 +67,119 @@ type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => vo
 
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
 type StandaloneWindowStatus = RemoteStatus | "opening";
+type SettingsSection = "video" | "audio" | "clipboard" | "window" | "trusted" | "diagnostics";
+type DiagnosticEvent =
+  | "connection_started"
+  | "connection_approved"
+  | "connection_established"
+  | "connection_failed"
+  | "connection_interrupted"
+  | "connection_closed"
+  | "agent_started"
+  | "agent_stopped"
+  | "agent_start_failed"
+  | "agent_stop_failed"
+  | "agent_connection_approved"
+  | "agent_connection_established"
+  | "agent_connection_failed"
+  | "agent_connection_interrupted"
+  | "agent_connection_closed"
+  | "file_transfer_started"
+  | "file_transfer_interrupted"
+  | "file_transfer_completed"
+  | "file_transfer_failed"
+  | "clipboard_sync_failed"
+  | "quality_reduced"
+  | "quality_restored";
 
 const STORAGE_KEY = "lantern.devices";
 const QUALITY_STORAGE_KEY = "lantern.video-quality";
 const LAYOUT_STORAGE_KEY = "lantern.device-layout";
 const CLIPBOARD_STORAGE_KEY = "lantern.clipboard-enabled";
+const SYSTEM_AUDIO_PLAY_STORAGE_KEY = "lantern.play-remote-system-audio";
+const SYSTEM_AUDIO_SHARE_STORAGE_KEY = "lantern.share-system-audio";
+const CAPTURE_DISPLAY_STORAGE_KEY = "lantern.capture-display";
 const DEFAULT_PORT = "4200";
+const FILE_TRANSFER_IDENTITIES_KEY = "lantern.file-transfer-identities";
 
 function readDeviceLayout(): DeviceLayout {
   const value = localStorage.getItem(LAYOUT_STORAGE_KEY);
   return value === "tile" || value === "list" ? value : "grid";
 }
 
+function readPendingFileIdentities(): PendingFileIdentity[] {
+  const raw = localStorage.getItem(FILE_TRANSFER_IDENTITIES_KEY);
+  if (!raw) return [];
+  const parsed: unknown = JSON.parse(raw);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((item) =>
+      typeof item !== "object" ||
+      item === null ||
+      typeof item.fingerprint !== "string" ||
+      !/^[a-f0-9]{64}$/.test(item.fingerprint) ||
+      typeof item.transferId !== "string" ||
+      typeof item.updatedAt !== "number"
+    )
+  ) {
+    throw new Error("本机文件续传记录格式无效。");
+  }
+  const expiration = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  return parsed.filter((item: PendingFileIdentity) => item.updatedAt >= expiration);
+}
+
+function rememberFileTransfer(fingerprint: string): string {
+  const identities = readPendingFileIdentities().filter((item) => item.fingerprint !== fingerprint);
+  const transferId = crypto.randomUUID();
+  identities.push({ fingerprint, transferId, updatedAt: Date.now() });
+  localStorage.setItem(FILE_TRANSFER_IDENTITIES_KEY, JSON.stringify(identities));
+  return transferId;
+}
+
+async function getOrCreateFileTransferId(
+  fileName: string,
+  sha256: string,
+  targetIdentity: string,
+): Promise<string> {
+  const identityDigest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${targetIdentity}\0${fileName}\0${sha256}`),
+  );
+  const fingerprint = Array.from(new Uint8Array(identityDigest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const identities = readPendingFileIdentities();
+  const existing = identities.find((item) => item.fingerprint === fingerprint);
+  if (existing) {
+    existing.updatedAt = Date.now();
+    localStorage.setItem(FILE_TRANSFER_IDENTITIES_KEY, JSON.stringify(identities));
+    return existing.transferId;
+  }
+  return rememberFileTransfer(fingerprint);
+}
+
+function forgetFileTransfer(transferId: string) {
+  const identities = readPendingFileIdentities().filter((item) => item.transferId !== transferId);
+  localStorage.setItem(FILE_TRANSFER_IDENTITIES_KEY, JSON.stringify(identities));
+}
+
+async function hashFile(file: File): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 function readClipboardEnabled() {
   return localStorage.getItem(CLIPBOARD_STORAGE_KEY) === "true";
+}
+
+function readSystemAudioPreference(key: string) {
+  return localStorage.getItem(key) === "true";
+}
+
+function readCaptureDisplayId(): number | null {
+  const value = localStorage.getItem(CAPTURE_DISPLAY_STORAGE_KEY);
+  if (value === null) return null;
+  const displayId = Number(value);
+  return Number.isSafeInteger(displayId) && displayId >= 0 ? displayId : null;
 }
 
 function readVideoQuality(): VideoQuality {
@@ -133,6 +259,10 @@ function App() {
   const [storageError, setStorageError] = useState(savedState.error);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [editingDevice, setEditingDevice] = useState<Device | null>(null);
+  const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveredDevice[]>([]);
+  const [discoveryStatus, setDiscoveryStatus] = useState("");
+  const [isDiscovering, setIsDiscovering] = useState(false);
   const [openDeviceMenuId, setOpenDeviceMenuId] = useState<string | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<Device | null>(null);
   const [videoQuality, setVideoQuality] = useState<VideoQuality>(() => {
@@ -148,6 +278,18 @@ function App() {
   const [isLoadingLocalInfo, setIsLoadingLocalInfo] = useState(false);
   const [copyAddressStatus, setCopyAddressStatus] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("video");
+  const [diagnosticLog, setDiagnosticLog] = useState("");
+  const [diagnosticLogError, setDiagnosticLogError] = useState("");
+  const [availableDisplays, setAvailableDisplays] = useState<AvailableDisplay[]>([]);
+  const [selectedDisplayId, setSelectedDisplayId] = useState<number | null>(() => {
+    try {
+      return readCaptureDisplayId();
+    } catch {
+      return null;
+    }
+  });
+  const [displaySettingsError, setDisplaySettingsError] = useState("");
   const [closeToTray, setCloseToTray] = useState(true);
   const [closeToTrayError, setCloseToTrayError] = useState("");
   const [savingCloseToTray, setSavingCloseToTray] = useState(false);
@@ -165,33 +307,81 @@ function App() {
       return false;
     }
   });
+  const [playRemoteSystemAudio, setPlayRemoteSystemAudio] = useState(() => {
+    try {
+      return readSystemAudioPreference(SYSTEM_AUDIO_PLAY_STORAGE_KEY);
+    } catch {
+      return false;
+    }
+  });
+  const [shareSystemAudio, setShareSystemAudio] = useState(() => {
+    try {
+      return readSystemAudioPreference(SYSTEM_AUDIO_SHARE_STORAGE_KEY);
+    } catch {
+      return false;
+    }
+  });
+  const [audioStatus, setAudioStatus] = useState("");
+  const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
   const [trustedDevices, setTrustedDevices] = useState<TrustedDevice[]>([]);
   const [trustedDevicesError, setTrustedDevicesError] = useState("");
   const [trustCurrentDevice, setTrustCurrentDevice] = useState(false);
   const [pendingFileOffer, setPendingFileOffer] = useState<FileOffer | null>(null);
   const [pendingClipboardOffer, setPendingClipboardOffer] = useState<ClipboardOffer | null>(null);
+  const [activeFileTransfer, setActiveFileTransfer] = useState<ActiveFileTransfer | null>(null);
   const [transferStatus, setTransferStatus] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const agentFileInputRef = useRef<HTMLInputElement>(null);
   const incomingFileTransferRef = useRef<IncomingFileTransfer | null>(null);
-  const pendingAgentFileRef = useRef<{ transferId: string; file: File } | null>(null);
+  const pendingAgentFileRef = useRef<{
+    transferId: string;
+    file: File;
+    sha256: string;
+    paused: boolean;
+    cancelled: boolean;
+  } | null>(null);
+  const agentPeerIdentityRef = useRef("");
   const lastClipboardTextRef = useRef<string | null>(null);
   const clipboardReadErrorReportedRef = useRef(false);
+
+  function updateActiveFileTransfer(next: ActiveFileTransfer | null) {
+    activeFileTransferRef.current = next;
+    setActiveFileTransfer(next);
+  }
+
+  function clearFileTransferIdentity(transferId: string) {
+    try {
+      forgetFileTransfer(transferId);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法更新本机续传记录：${detail}`);
+    }
+  }
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
   const [error, setError] = useState("");
   const hasMounted = useRef(false);
   const connectionRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const connectionTimeoutRef = useRef<number | null>(null);
+  const connectionRecoveryTimerRef = useRef<number | null>(null);
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
   const pressedRemoteMouseButtonsRef = useRef<Set<string>>(new Set());
-  const pendingFileSendsRef = useRef<Map<string, File>>(new Map());
+  const pendingFileSendsRef = useRef<Map<string, {
+    file: File;
+    sha256: string;
+    paused: boolean;
+    cancelled: boolean;
+  }>>(new Map());
+  const activeFileTransferRef = useRef<ActiveFileTransfer | null>(null);
   const clipboardSessionAllowedRef = useRef(false);
   const remoteStreamRef = useRef<MediaStream | null>(null);
   const pendingRemoteCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const lastPointerMove = useRef(0);
   const viewerRef = useRef<HTMLDivElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement>(null);
+  const remoteAudioStreamRef = useRef<MediaStream | null>(null);
   const standaloneClosingRef = useRef(false);
   const [agentRunning, setAgentRunning] = useState(false);
   const [agentAddress, setAgentAddress] = useState("");
@@ -372,6 +562,89 @@ function App() {
   }, [clipboardEnabled, connectionStatus]);
 
   useEffect(() => {
+    if (connectionStatus !== "connected") return;
+    let cancelled = false;
+    let previousReceived: number | null = null;
+    let previousLost: number | null = null;
+    let poorSamples = 0;
+    let goodSamples = 0;
+    let statsReadErrorReported = false;
+    let level: "normal" | "constrained" = "normal";
+    const sampleNetwork = async () => {
+      const peer = peerConnectionRef.current;
+      const socket = connectionRef.current;
+      if (!peer || peer.connectionState !== "connected" || !socket || socket.readyState !== WebSocket.OPEN) return;
+      try {
+        const stats = await peer.getStats();
+        if (cancelled || peerConnectionRef.current !== peer) return;
+        statsReadErrorReported = false;
+        let received = 0;
+        let lost = 0;
+        let roundTripTime = 0;
+        stats.forEach((stat) => {
+          if (stat.type === "inbound-rtp") {
+            const video = stat as RTCInboundRtpStreamStats & { kind?: string; mediaType?: string };
+            if ((video.kind ?? video.mediaType) === "video") {
+              received = video.packetsReceived ?? 0;
+              lost = video.packetsLost ?? 0;
+            }
+          } else if (stat.type === "candidate-pair") {
+            const pair = stat as RTCIceCandidatePairStats;
+            if (pair.state === "succeeded" && pair.nominated) {
+              roundTripTime = pair.currentRoundTripTime ?? 0;
+            }
+          }
+        });
+        if (previousReceived !== null && previousLost !== null) {
+          const receivedDelta = Math.max(0, received - previousReceived);
+          const lostDelta = Math.max(0, lost - previousLost);
+          const samplePackets = receivedDelta + lostDelta;
+          const lossRate = lostDelta / Math.max(1, samplePackets);
+          if (roundTripTime >= 0.3 || (samplePackets > 0 && lossRate >= 0.05)) {
+            poorSamples += 1;
+            goodSamples = 0;
+          } else if (
+            samplePackets > 0 &&
+            roundTripTime > 0 &&
+            roundTripTime <= 0.18 &&
+            lossRate <= 0.01
+          ) {
+            goodSamples += 1;
+            poorSamples = 0;
+          } else {
+            poorSamples = 0;
+            goodSamples = 0;
+          }
+          const nextLevel =
+            level === "normal" && poorSamples >= 2 ? "constrained" :
+              level === "constrained" && goodSamples >= 3 ? "normal" : level;
+          if (nextLevel !== level) {
+            level = nextLevel;
+            socket.send(JSON.stringify({ type: "quality_adjust", level }));
+            recordDiagnosticEvent(level === "constrained" ? "quality_reduced" : "quality_restored");
+            setTransferStatus(level === "constrained"
+              ? "检测到网络延迟或丢包，已降低远端视频码率。"
+              : "网络状态已恢复，已还原远端视频码率。");
+          }
+        }
+        previousReceived = received;
+        previousLost = lost;
+      } catch (cause) {
+        if (cancelled || statsReadErrorReported) return;
+        statsReadErrorReported = true;
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setTransferStatus(`无法读取网络质量统计：${detail}`);
+      }
+    };
+    void sampleNetwork();
+    const timer = window.setInterval(() => void sampleNetwork(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [connectionStatus]);
+
+  useEffect(() => {
     if (!standaloneDeviceId && deviceLayout === "list" && connectionDeviceId) disconnectFromDevice();
   }, [deviceLayout, standaloneDeviceId]);
 
@@ -403,11 +676,13 @@ function App() {
     try {
       localStorage.setItem(LAYOUT_STORAGE_KEY, deviceLayout);
       localStorage.setItem(CLIPBOARD_STORAGE_KEY, String(clipboardEnabled));
+      localStorage.setItem(SYSTEM_AUDIO_PLAY_STORAGE_KEY, String(playRemoteSystemAudio));
+      localStorage.setItem(SYSTEM_AUDIO_SHARE_STORAGE_KEY, String(shareSystemAudio));
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setStorageError(`无法保存应用偏好：${detail}`);
     }
-  }, [deviceLayout, clipboardEnabled]);
+  }, [deviceLayout, clipboardEnabled, playRemoteSystemAudio, shareSystemAudio]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -420,11 +695,60 @@ function App() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    void invoke("set_system_audio_sync_enabled", { enabled: shareSystemAudio })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setStorageError(`无法设置系统声音共享：${detail}`);
+      });
+  }, [shareSystemAudio]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen<string>("agent-audio-status", ({ payload }) => setAudioStatus(payload))
+      .then((stopListening) => {
+        if (cancelled) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setAudioStatus(`无法读取被控端声音状态：${detail}`);
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (selectedDisplayId === null) {
+        localStorage.removeItem(CAPTURE_DISPLAY_STORAGE_KEY);
+      } else {
+        localStorage.setItem(CAPTURE_DISPLAY_STORAGE_KEY, String(selectedDisplayId));
+      }
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDisplaySettingsError(`无法保存显示器偏好：${detail}`);
+    }
+    if (!isTauri()) return;
+    void invoke("set_capture_display", { displayId: selectedDisplayId })
+      .then(() => setDisplaySettingsError(""))
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setDisplaySettingsError(`无法应用显示器选择：${detail}`);
+      });
+  }, [selectedDisplayId]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
     let cancelled = false;
     let unlistenRequest: (() => void) | undefined;
     let unlistenRequestEnded: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
     let unlistenAgentConnection: (() => void) | undefined;
+    let unlistenAgentPeerIdentity: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;
     let unlistenFileOffer: (() => void) | undefined;
     let unlistenFileReceived: (() => void) | undefined;
@@ -471,10 +795,19 @@ function App() {
         if (!isMainWindow) return;
         setAgentConnected(event.payload);
         if (!event.payload) {
+          agentPeerIdentityRef.current = "";
           clipboardSessionAllowedRef.current = false;
+          if (pendingAgentFileRef.current) {
+            recordDiagnosticEvent("file_transfer_interrupted");
+            setAgentClipboardStatus("连接已断开，续传进度已保留；重新连接后再次选择同一文件即可继续。");
+          }
           pendingAgentFileRef.current = null;
+          updateActiveFileTransfer(null);
           setPendingClipboardOffer(null);
         }
+      }),
+      listen<string>("agent-peer-identity", ({ payload }) => {
+        if (isMainWindow) agentPeerIdentityRef.current = payload;
       }),
       listen<ClipboardOffer>("remote-clipboard-offer", (event) => {
         if (!isMainWindow) return;
@@ -483,6 +816,7 @@ function App() {
             .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
             .catch((cause: unknown) => {
               const detail = cause instanceof Error ? cause.message : String(cause);
+              recordDiagnosticEvent("clipboard_sync_failed");
               setTransferStatus(`无法写入剪贴板：${detail}`);
             })
             .finally(restoreRemoteFocus);
@@ -500,12 +834,13 @@ function App() {
         if (!isMainWindow) return;
         setTransferStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
       }),
-    ]).then(([requestListener, requestEndedListener, statusListener, agentConnectionListener, clipboardListener, fileListener, receivedListener]) => {
+    ]).then(([requestListener, requestEndedListener, statusListener, agentConnectionListener, peerIdentityListener, clipboardListener, fileListener, receivedListener]) => {
       if (cancelled) {
         requestListener();
         requestEndedListener();
         statusListener();
         agentConnectionListener();
+        peerIdentityListener();
         clipboardListener();
         fileListener();
         receivedListener();
@@ -515,6 +850,7 @@ function App() {
       unlistenRequestEnded = requestEndedListener;
       unlistenStatus = statusListener;
       unlistenAgentConnection = agentConnectionListener;
+      unlistenAgentPeerIdentity = peerIdentityListener;
       unlistenClipboard = clipboardListener;
       unlistenFileOffer = fileListener;
       unlistenFileReceived = receivedListener;
@@ -529,6 +865,7 @@ function App() {
       unlistenRequestEnded?.();
       unlistenStatus?.();
       unlistenAgentConnection?.();
+      unlistenAgentPeerIdentity?.();
       unlistenClipboard?.();
       unlistenFileOffer?.();
       unlistenFileReceived?.();
@@ -568,8 +905,17 @@ function App() {
     let unlistenDecision: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
     let unlistenClipboard: (() => void) | undefined;
+    let unlistenFileControl: (() => void) | undefined;
+    let unlistenFileProgress: (() => void) | undefined;
+    let unlistenFileComplete: (() => void) | undefined;
+    let unlistenFileError: (() => void) | undefined;
     void Promise.all([
-      listen<{ transferId: string; accepted: boolean; error?: string }>(
+      listen<{
+        transferId: string;
+        accepted: boolean;
+        resumeOffset: number;
+        error?: string;
+      }>(
         "agent-file-transfer-decision",
         ({ payload }) => {
           const pending = pendingAgentFileRef.current;
@@ -578,12 +924,16 @@ function App() {
             return;
           }
           if (payload.error) {
+            recordDiagnosticEvent("file_transfer_failed");
             pendingAgentFileRef.current = null;
+            updateActiveFileTransfer(null);
             setAgentClipboardStatus(payload.error);
           } else if (payload.accepted) {
-            void transmitAgentFile(pending.transferId, pending.file);
+            void transmitAgentFile(pending.transferId, pending.file, payload.resumeOffset);
           } else {
+            recordDiagnosticEvent("file_transfer_failed");
             pendingAgentFileRef.current = null;
+            updateActiveFileTransfer(null);
             setAgentClipboardStatus(`${pending.file.name}：控制端拒绝接收。`);
           }
         },
@@ -593,17 +943,83 @@ function App() {
       }),
       listen<string>("clipboard-status", ({ payload }) => {
         setAgentClipboardStatus(payload);
+        recordDiagnosticEvent("clipboard_sync_failed");
       }),
-    ]).then(([decisionListener, statusListener, clipboardListener]) => {
+      listen<{ transferId: string; action: "pause" | "resume" | "cancel" }>(
+        "agent-file-transfer-control",
+        ({ payload }) => {
+          const pending = pendingAgentFileRef.current;
+          if (pending?.transferId === payload.transferId) {
+            if (payload.action === "cancel") {
+              pending.cancelled = true;
+              clearFileTransferIdentity(pending.transferId);
+              pendingAgentFileRef.current = null;
+              updateActiveFileTransfer(null);
+              setAgentClipboardStatus("对端已取消文件传输。");
+              return;
+            }
+            pending.paused = payload.action === "pause";
+          }
+          const active = activeFileTransferRef.current;
+          if (active?.transferId === payload.transferId) {
+            if (payload.action === "cancel") {
+              updateActiveFileTransfer(null);
+              setAgentClipboardStatus(`已取消 ${active.fileName} 的文件传输。`);
+            } else {
+              updateActiveFileTransfer({ ...active, paused: payload.action === "pause" });
+              setAgentClipboardStatus(payload.action === "pause" ? "文件传输已暂停。" : "文件传输已继续。");
+            }
+          }
+        },
+      ),
+      listen<{ transferId: string; receivedBytes: number }>(
+        "agent-file-transfer-progress",
+        ({ payload }) => {
+          const active = activeFileTransferRef.current;
+          if (active?.transferId === payload.transferId) {
+            updateActiveFileTransfer({ ...active, transferred: payload.receivedBytes });
+          }
+        },
+      ),
+      listen<{ transferId: string }>(
+        "agent-file-transfer-complete",
+        ({ payload }) => {
+          if (pendingAgentFileRef.current?.transferId === payload.transferId) {
+            pendingAgentFileRef.current = null;
+            updateActiveFileTransfer(null);
+          }
+          clearFileTransferIdentity(payload.transferId);
+          setAgentClipboardStatus("文件已成功送达控制端。");
+        },
+      ),
+      listen<{ transferId: string; message: string }>(
+        "agent-file-transfer-error",
+        ({ payload }) => {
+          if (pendingAgentFileRef.current?.transferId === payload.transferId) {
+            pendingAgentFileRef.current = null;
+            updateActiveFileTransfer(null);
+          }
+          setAgentClipboardStatus(`文件接收端报告失败：${payload.message}。续传标识已保留。`);
+        },
+      ),
+    ]).then(([decisionListener, statusListener, clipboardListener, controlListener, progressListener, completeListener, errorListener]) => {
       if (cancelled) {
         decisionListener();
         statusListener();
         clipboardListener();
+        controlListener();
+        progressListener();
+        completeListener();
+        errorListener();
         return;
       }
       unlistenDecision = decisionListener;
       unlistenStatus = statusListener;
       unlistenClipboard = clipboardListener;
+      unlistenFileControl = controlListener;
+      unlistenFileProgress = progressListener;
+      unlistenFileComplete = completeListener;
+      unlistenFileError = errorListener;
     }).catch((cause: unknown) => {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentStatus(`无法接收剪贴板或文件传输状态：${detail}`);
@@ -613,6 +1029,10 @@ function App() {
       unlistenDecision?.();
       unlistenStatus?.();
       unlistenClipboard?.();
+      unlistenFileControl?.();
+      unlistenFileProgress?.();
+      unlistenFileComplete?.();
+      unlistenFileError?.();
     };
   }, []);
 
@@ -650,6 +1070,13 @@ function App() {
       void video.play().catch(() => {
         setConnectionError("无法播放远程视频流，请检查应用的媒体权限。");
       });
+    }
+  }, [connectionStatus]);
+
+  useEffect(() => {
+    const peer = peerConnectionRef.current;
+    if (connectionStatus === "connected" && peer && remoteAudioStreamRef.current) {
+      startRemoteAudioPlayback(peer);
     }
   }, [connectionStatus]);
 
@@ -715,8 +1142,15 @@ function App() {
       (status) => status === "opening" || status === "connecting" ||
         status === "waitingApproval" || status === "connected",
     );
+  const playRemoteAudioSettingLocked =
+    connectionStatus !== "idle" ||
+    Object.values(standaloneWindowStatuses).some(
+      (status) => status === "opening" || status === "connecting" ||
+        status === "waitingApproval" || status === "connected",
+    );
+  const shareSystemAudioSettingLocked = agentConnected || pendingRequest !== null;
 
-  function addDevice(event: React.FormEvent<HTMLFormElement>) {
+  function saveDevice(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmedName = name.trim();
     const trimmedAddress = address.trim();
@@ -731,23 +1165,66 @@ function App() {
     }
     const normalizedAddress = normalizeAddress(trimmedAddress);
     if (devices.some(
-      (device) => isValidAddress(device.address) && normalizeAddress(device.address) === normalizedAddress,
+      (device) =>
+        device.id !== editingDevice?.id &&
+        isValidAddress(device.address) &&
+        normalizeAddress(device.address) === normalizedAddress,
     )) {
       setError("这个地址已在设备列表中。");
       return;
     }
 
-    const device = {
-      id: crypto.randomUUID(),
-      name: trimmedName,
-      address: normalizedAddress,
-    };
-    setDevices((current) => [...current, device]);
-    setActiveId(device.id);
+    if (editingDevice) {
+      setDevices((current) => current.map((device) =>
+        device.id === editingDevice.id
+          ? { ...device, name: trimmedName, address: normalizedAddress }
+          : device,
+      ));
+    } else {
+      const device = {
+        id: crypto.randomUUID(),
+        name: trimmedName,
+        address: normalizedAddress,
+      };
+      setDevices((current) => [...current, device]);
+      setActiveId(device.id);
+    }
     setName("");
     setAddress("");
     setError("");
     setIsAdding(false);
+    setEditingDevice(null);
+    setDiscoveredDevices([]);
+    setDiscoveryStatus("");
+  }
+
+  function closeDeviceForm() {
+    setIsAdding(false);
+    setEditingDevice(null);
+    setName("");
+    setAddress("");
+    setError("");
+    setDiscoveredDevices([]);
+    setDiscoveryStatus("");
+  }
+
+  async function discoverDevices() {
+    if (!isTauri()) {
+      setDiscoveryStatus("设备发现仅在 Lantern 桌面应用中可用。");
+      return;
+    }
+    setIsDiscovering(true);
+    setDiscoveryStatus("");
+    try {
+      const discovered = await invoke<DiscoveredDevice[]>("discover_lan_devices");
+      setDiscoveredDevices(discovered);
+      setDiscoveryStatus(discovered.length ? `找到 ${discovered.length} 台正在运行被控端的设备。` : "未发现设备；请确认对端已启动被控端并处于同一局域网。");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDiscoveryStatus(`扫描失败：${detail}`);
+    } finally {
+      setIsDiscovering(false);
+    }
   }
 
   function removeDevice(id: string) {
@@ -827,12 +1304,61 @@ function App() {
   async function openSettings() {
     setShowSettings(true);
     if (!isTauri()) return;
+    void refreshDiagnosticLog();
     setTrustedDevicesError("");
-    try {
-      setTrustedDevices(await invoke<TrustedDevice[]>("get_trusted_devices"));
-    } catch (cause) {
+    const [trustedDevicesResult, displaysResult] = await Promise.allSettled([
+      invoke<TrustedDevice[]>("get_trusted_devices"),
+      invoke<AvailableDisplay[]>("get_available_displays"),
+    ]);
+    if (trustedDevicesResult.status === "fulfilled") {
+      setTrustedDevices(trustedDevicesResult.value);
+    } else {
+      const cause = trustedDevicesResult.reason;
       const detail = cause instanceof Error ? cause.message : String(cause);
       setTrustedDevicesError(`无法读取信任设备：${detail}`);
+    }
+    if (displaysResult.status === "fulfilled") {
+      setAvailableDisplays(displaysResult.value);
+      if (selectedDisplayId !== null &&
+          !displaysResult.value.some((display) => display.id === selectedDisplayId)) {
+        setSelectedDisplayId(null);
+      }
+    } else {
+      const cause = displaysResult.reason;
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDisplaySettingsError(`无法读取显示器列表：${detail}`);
+    }
+  }
+
+  async function refreshDiagnosticLog() {
+    if (!isTauri()) {
+      setDiagnosticLogError("诊断日志仅在 Lantern 桌面应用中可用。");
+      return;
+    }
+    setDiagnosticLogError("");
+    try {
+      setDiagnosticLog(await invoke<string>("get_diagnostic_log"));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDiagnosticLogError(`无法读取诊断日志：${detail}`);
+    }
+  }
+
+  function recordDiagnosticEvent(event: DiagnosticEvent) {
+    if (!isTauri()) return;
+    void invoke("log_diagnostic_event", { event }).catch((cause: unknown) => {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDiagnosticLogError(`无法写入本机诊断日志：${detail}`);
+    });
+  }
+
+  async function copyDiagnosticLog() {
+    try {
+      await navigator.clipboard.writeText(diagnosticLog);
+      setDiagnosticLogError("诊断日志已复制到剪贴板。");
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setDiagnosticLogError(`无法复制诊断日志：${detail}`);
     }
   }
 
@@ -930,11 +1456,13 @@ function App() {
     }
     try {
       const address = await invoke<string>("start_agent");
+      recordDiagnosticEvent("agent_started");
       setAgentAddress(address);
       setAgentRunning(true);
       setAgentStatus("正在局域网等待连接。新连接必须在被控端本机批准。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("agent_start_failed");
       setAgentStatus(`启动失败：${detail}`);
     }
   }
@@ -942,12 +1470,14 @@ function App() {
   async function stopAgent() {
     try {
       await invoke("stop_agent");
+      recordDiagnosticEvent("agent_stopped");
       setAgentRunning(false);
       setAgentConnected(false);
       setPendingRequest(null);
       setAgentStatus("远程服务已停止");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("agent_stop_failed");
       setAgentStatus(`停止失败：${detail}`);
     }
   }
@@ -978,11 +1508,24 @@ function App() {
       return;
     }
     disconnectFromDevice(false);
+    recordDiagnosticEvent("connection_started");
+    connectionTimeoutRef.current = window.setTimeout(() => {
+      if (connectionRef.current &&
+          !(peerConnectionRef.current?.connectionState === "connected" &&
+            controlChannelRef.current?.readyState === "open")) {
+        recordDiagnosticEvent("connection_failed");
+        setConnectionStatus("error");
+        setConnectionError("连接建立超时。请检查被控端审批状态以及局域网 UDP 防火墙设置，然后重试。");
+        connectionRef.current.close();
+      }
+    }, 90_000);
     setActiveId(device.id);
     setConnectionDeviceId(device.id);
     setConnectionStatus("connecting");
     setConnectionError("");
     setEncoderStatus("");
+    setAudioStatus(playRemoteSystemAudio ? "正在等待远端系统声音…" : "");
+    setAudioPlaybackBlocked(false);
 
     try {
       const endpoint = new URL(`http://${device.address}`);
@@ -1002,6 +1545,7 @@ function App() {
           device_name: "Lantern 控制端",
           quality: videoQuality,
           clipboard_enabled: clipboardEnabled,
+          system_audio_enabled: playRemoteSystemAudio,
         }));
       };
       socket.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
@@ -1014,10 +1558,14 @@ function App() {
           incoming.receivedBytes += event.data.byteLength;
           if (incoming.receivedBytes > incoming.size) {
             incomingFileTransferRef.current = null;
-            cancelControllerFileReceive(incoming.transferId);
+            cancelControllerFileReceive(incoming.transferId, incoming.writeQueue);
             setTransferStatus("收到的文件数据超过声明大小，传输已中止。");
             socket.close();
             return;
+          }
+          const active = activeFileTransferRef.current;
+          if (active?.transferId === incoming.transferId) {
+            updateActiveFileTransfer({ ...active, transferred: incoming.receivedBytes });
           }
           const chunk = Array.from(new Uint8Array(event.data));
           incoming.writeQueue = incoming.writeQueue.then(async () => {
@@ -1040,14 +1588,18 @@ function App() {
           sdpMid?: string | null;
           sdpMLineIndex?: number | null;
           transfer_id?: string;
+          action?: string;
           accepted?: boolean;
           text?: string;
           file_name?: string;
           size?: number;
+          sha256?: string;
+          resume_offset?: number;
         };
         try {
           message = JSON.parse(event.data) as typeof message;
         } catch {
+          recordDiagnosticEvent("connection_failed");
           setConnectionStatus("error");
           setConnectionError("无法解析远程端的信令响应。");
           socket.close();
@@ -1055,8 +1607,11 @@ function App() {
         }
 
         if (message.type === "approved") {
+          recordDiagnosticEvent("connection_approved");
           setConnectionStatus("connecting");
-          void startWebRtcConnection(socket);
+          void startWebRtcConnection(socket, playRemoteSystemAudio);
+        } else if (message.type === "audio_status" && typeof message.status === "string") {
+          setAudioStatus(message.status);
         } else if (message.type === "answer" && message.sdp) {
           const peer = peerConnectionRef.current;
           if (!peer) return;
@@ -1068,8 +1623,10 @@ function App() {
             .catch((cause: unknown) => {
               if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
               const detail = cause instanceof Error ? cause.message : String(cause);
+              recordDiagnosticEvent("connection_failed");
               setConnectionStatus("error");
               setConnectionError(`无法协商 WebRTC 媒体连接：${detail}`);
+              socket.close();
             });
         } else if (message.type === "ice_candidate" && message.candidate) {
           const candidate: RTCIceCandidateInit = {
@@ -1083,8 +1640,10 @@ function App() {
             void peer.addIceCandidate(candidate).catch((cause: unknown) => {
               if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
               const detail = cause instanceof Error ? cause.message : String(cause);
+              recordDiagnosticEvent("connection_failed");
               setConnectionStatus("error");
               setConnectionError(`无法添加 WebRTC 网络候选：${detail}`);
+              socket.close();
             });
           } else {
             pendingRemoteCandidatesRef.current.push(candidate);
@@ -1098,6 +1657,8 @@ function App() {
           typeof message.transfer_id === "string" &&
           typeof message.file_name === "string" &&
           typeof message.size === "number" &&
+          typeof message.sha256 === "string" &&
+          /^[a-f0-9]{64}$/.test(message.sha256) &&
           message.size > 0 &&
           message.size <= 100 * 1024 * 1024
         ) {
@@ -1105,6 +1666,8 @@ function App() {
             transferId: message.transfer_id,
             fileName: message.file_name,
             size: message.size,
+            sha256: message.sha256,
+            receivedBytes: 0,
             direction: "from-agent",
           });
           void focusCurrentWindow();
@@ -1120,21 +1683,82 @@ function App() {
         } else if (message.type === "file_complete" && message.transfer_id) {
           void finishIncomingAgentFile(socket, message.transfer_id);
         } else if (message.type === "file_transfer_decision" && message.transfer_id) {
-          const file = pendingFileSendsRef.current.get(message.transfer_id);
-          if (!file) return;
+          const session = pendingFileSendsRef.current.get(message.transfer_id);
+          if (!session) return;
           if (!message.accepted) {
             pendingFileSendsRef.current.delete(message.transfer_id);
-            setTransferStatus(`${file.name}：对端拒绝接收。`);
+            updateActiveFileTransfer(null);
+            setTransferStatus(`${session.file.name}：对端拒绝接收。`);
           } else {
-            void transmitFile(socket, message.transfer_id, file);
+            const resumeOffset = message.resume_offset ?? 0;
+            if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0 || resumeOffset > session.file.size) {
+              setTransferStatus("对端返回了无效的续传进度。");
+              socket.close();
+              return;
+            }
+            void transmitFile(socket, message.transfer_id, session.file, resumeOffset);
           }
-        } else if (message.type === "file_transfer_complete") {
+        } else if (message.type === "file_transfer_complete" && message.transfer_id) {
+          const session = pendingFileSendsRef.current.get(message.transfer_id);
+          if (session) {
+            clearFileTransferIdentity(message.transfer_id);
+            pendingFileSendsRef.current.delete(message.transfer_id);
+          }
           setTransferStatus("文件已成功发送。");
+          updateActiveFileTransfer(null);
+        } else if (
+          message.type === "file_transfer_control" &&
+          typeof message.transfer_id === "string" &&
+          ["pause", "resume", "cancel"].includes(message.action ?? "")
+        ) {
+          const active = activeFileTransferRef.current;
+          if (active?.transferId === message.transfer_id) {
+            if (message.action === "cancel") {
+              if (active.mode === "send") {
+                const session = pendingFileSendsRef.current.get(message.transfer_id);
+                if (session) {
+                  session.cancelled = true;
+                  clearFileTransferIdentity(message.transfer_id);
+                }
+                pendingFileSendsRef.current.delete(message.transfer_id);
+              } else {
+                const incoming = incomingFileTransferRef.current;
+                if (incoming?.transferId === message.transfer_id) {
+                  incomingFileTransferRef.current = null;
+                  cancelControllerFileReceive(message.transfer_id, incoming.writeQueue);
+                }
+              }
+              updateActiveFileTransfer(null);
+              setTransferStatus(`对端已取消 ${active.fileName} 的文件传输。`);
+            } else {
+              const session = pendingFileSendsRef.current.get(message.transfer_id);
+              if (session) session.paused = message.action === "pause";
+              updateActiveFileTransfer({ ...active, paused: message.action === "pause" });
+              setTransferStatus(message.action === "pause" ? `对端已暂停 ${active.fileName}。` : `对端已继续 ${active.fileName}。`);
+            }
+          }
         } else if (message.type === "file_transfer_error" && message.message) {
-          setTransferStatus(message.message);
+          const transferId = typeof message.transfer_id === "string" ? message.transfer_id : "";
+          const sending = transferId ? pendingFileSendsRef.current.get(transferId) : undefined;
+          if (sending) pendingFileSendsRef.current.delete(transferId);
+          const incoming = incomingFileTransferRef.current;
+          if (incoming?.transferId === transferId) {
+            incomingFileTransferRef.current = null;
+            suspendControllerFileReceive(transferId, incoming.writeQueue);
+          }
+          if (activeFileTransferRef.current?.transferId === transferId) {
+            updateActiveFileTransfer(null);
+          }
+          recordDiagnosticEvent("file_transfer_failed");
+          setTransferStatus(
+            sending
+              ? `${sending.file.name}：${message.message}续传标识已保留，可重新连接后再次选择同一文件。`
+              : message.message,
+          );
         } else if (message.type === "clipboard_error" && message.message) {
           setTransferStatus(message.message);
         } else if (message.type === "error") {
+          recordDiagnosticEvent("connection_failed");
           setConnectionStatus("error");
           setConnectionError(message.message ?? "远程端返回错误。");
           socket.close();
@@ -1145,16 +1769,28 @@ function App() {
       };
       socket.onerror = () => {
         if (connectionRef.current !== socket) return;
+        recordDiagnosticEvent("connection_failed");
         setConnectionStatus("error");
         setConnectionError("连接失败。请确认对端已启动、地址正确，且局域网未阻止 TCP 4200。");
+        socket.close();
       };
       socket.onclose = () => {
         if (connectionRef.current !== socket) return;
+        if (connectionTimeoutRef.current !== null) {
+          window.clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        if (connectionRecoveryTimerRef.current !== null) {
+          window.clearTimeout(connectionRecoveryTimerRef.current);
+          connectionRecoveryTimerRef.current = null;
+        }
+        recordDiagnosticEvent("connection_closed");
         connectionRef.current = null;
         const incomingFile = incomingFileTransferRef.current;
         incomingFileTransferRef.current = null;
         if (incomingFile) {
-          cancelControllerFileReceive(incomingFile.transferId);
+          recordDiagnosticEvent("file_transfer_interrupted");
+          suspendControllerFileReceive(incomingFile.transferId, incomingFile.writeQueue);
         }
         clipboardSessionAllowedRef.current = false;
         setPendingClipboardOffer(null);
@@ -1169,24 +1805,44 @@ function App() {
         }
         peerConnectionRef.current = null;
         remoteStreamRef.current = null;
+        remoteAudioStreamRef.current = null;
+        if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+        setAudioPlaybackBlocked(false);
         pendingRemoteCandidatesRef.current = [];
-        pendingFileSendsRef.current.clear();
+        if (pendingFileSendsRef.current.size > 0) {
+          recordDiagnosticEvent("file_transfer_interrupted");
+          setTransferStatus("连接已断开，续传进度已保留；重新连接后再次选择相同文件即可继续。");
+          pendingFileSendsRef.current.clear();
+        }
+        updateActiveFileTransfer(null);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setScreenSize({ width: 0, height: 0 });
         setConnectionStatus((status) => status === "error" ? status : "idle");
         setConnectionDeviceId((id) => id === device.id ? null : id);
       };
     } catch (cause) {
+      if (connectionTimeoutRef.current !== null) {
+        window.clearTimeout(connectionTimeoutRef.current);
+        connectionTimeoutRef.current = null;
+      }
+      if (connectionRecoveryTimerRef.current !== null) {
+        window.clearTimeout(connectionRecoveryTimerRef.current);
+        connectionRecoveryTimerRef.current = null;
+      }
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("connection_failed");
       setConnectionStatus("error");
       setConnectionError(`无法创建局域网连接：${detail}`);
     }
   }
 
-  async function startWebRtcConnection(socket: WebSocket) {
+  async function startWebRtcConnection(socket: WebSocket, receiveSystemAudio: boolean) {
     const peer = new RTCPeerConnection({ iceServers: [] });
     peerConnectionRef.current = peer;
     peer.addTransceiver("video", { direction: "recvonly" });
+    if (receiveSystemAudio) {
+      peer.addTransceiver("audio", { direction: "recvonly" });
+    }
 
     const controlChannel = peer.createDataChannel("control");
     controlChannelRef.current = controlChannel;
@@ -1196,7 +1852,16 @@ function App() {
         peer.connectionState === "connected" &&
         controlChannel.readyState === "open"
       ) {
+        if (connectionTimeoutRef.current !== null) {
+          window.clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        if (connectionRecoveryTimerRef.current !== null) {
+          window.clearTimeout(connectionRecoveryTimerRef.current);
+          connectionRecoveryTimerRef.current = null;
+        }
         setConnectionStatus("connected");
+        recordDiagnosticEvent("connection_established");
         window.setTimeout(() => viewerRef.current?.focus({ preventScroll: true }), 0);
       }
     };
@@ -1205,7 +1870,10 @@ function App() {
     };
     controlChannel.onerror = () => {
       if (peerConnectionRef.current !== peer) return;
+      recordDiagnosticEvent("connection_failed");
+      setConnectionStatus("error");
       setConnectionError("WebRTC 键鼠控制通道发生错误。");
+      socket.close();
     };
 
     let offerSent = false;
@@ -1228,6 +1896,12 @@ function App() {
     };
     peer.ontrack = (event) => {
       if (peerConnectionRef.current !== peer) return;
+      if (event.track.kind === "audio") {
+        remoteAudioStreamRef.current = new MediaStream([event.track]);
+        setAudioStatus("已连接远端系统声音。");
+        startRemoteAudioPlayback(peer);
+        return;
+      }
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       remoteStreamRef.current = stream;
       const video = remoteVideoRef.current;
@@ -1236,6 +1910,7 @@ function App() {
         void video.play().catch((cause: unknown) => {
           if (peerConnectionRef.current !== peer) return;
           const detail = cause instanceof Error ? cause.message : String(cause);
+          recordDiagnosticEvent("connection_failed");
           setConnectionError(`无法播放远程视频流：${detail}`);
         });
       }
@@ -1243,13 +1918,32 @@ function App() {
     peer.onconnectionstatechange = () => {
       if (peerConnectionRef.current !== peer) return;
       if (peer.connectionState === "connected") {
+        if (connectionRecoveryTimerRef.current !== null) {
+          window.clearTimeout(connectionRecoveryTimerRef.current);
+          connectionRecoveryTimerRef.current = null;
+        }
         markControlConnected();
       } else if (peer.connectionState === "failed") {
+        if (connectionTimeoutRef.current !== null) {
+          window.clearTimeout(connectionTimeoutRef.current);
+          connectionTimeoutRef.current = null;
+        }
+        recordDiagnosticEvent("connection_failed");
         setConnectionStatus("error");
         setConnectionError("WebRTC 媒体连接失败。请检查两台设备间的 UDP 防火墙设置。");
+        socket.close();
       } else if (peer.connectionState === "disconnected") {
-        setConnectionStatus("error");
-        setConnectionError("WebRTC 媒体连接中断。请检查局域网和 UDP 防火墙设置。");
+        if (connectionRecoveryTimerRef.current === null) {
+          recordDiagnosticEvent("connection_interrupted");
+          setTransferStatus("连接短暂中断，正在等待网络恢复…");
+          connectionRecoveryTimerRef.current = window.setTimeout(() => {
+            connectionRecoveryTimerRef.current = null;
+            if (peerConnectionRef.current !== peer || peer.connectionState !== "disconnected") return;
+            setConnectionStatus("error");
+            setConnectionError("WebRTC 连接中断，已清理连接。请检查网络后手动重试。");
+            socket.close();
+          }, 5_000);
+        }
       }
     };
 
@@ -1265,17 +1959,65 @@ function App() {
     } catch (cause) {
       if (connectionRef.current !== socket || peerConnectionRef.current !== peer) return;
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("connection_failed");
       setConnectionStatus("error");
       setConnectionError(`无法启动 WebRTC 连接：${detail}`);
       socket.close();
     }
   }
 
+  function startRemoteAudioPlayback(peer: RTCPeerConnection) {
+    const audio = remoteAudioRef.current;
+    const stream = remoteAudioStreamRef.current;
+    if (!audio || !stream || peerConnectionRef.current !== peer) return;
+    audio.srcObject = stream;
+    void audio.play()
+      .then(() => {
+        if (peerConnectionRef.current !== peer) return;
+        setAudioPlaybackBlocked(false);
+        setAudioStatus("正在播放远端系统声音。");
+      })
+      .catch(() => {
+        if (peerConnectionRef.current !== peer) return;
+        setAudioPlaybackBlocked(true);
+        setAudioStatus("远端系统声音已就绪，需要手动开始播放。");
+      });
+  }
+
+  function playRemoteAudio() {
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+    void audio.play()
+      .then(() => {
+        setAudioPlaybackBlocked(false);
+        setAudioStatus("正在播放远端系统声音。");
+      })
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setAudioStatus(`无法播放远端系统声音：${detail}`);
+      });
+  }
+
   function disconnectFromDevice(closeStandaloneWindow = true) {
+    if (connectionTimeoutRef.current !== null) {
+      window.clearTimeout(connectionTimeoutRef.current);
+      connectionTimeoutRef.current = null;
+    }
+    if (connectionRecoveryTimerRef.current !== null) {
+      window.clearTimeout(connectionRecoveryTimerRef.current);
+      connectionRecoveryTimerRef.current = null;
+    }
+    if (connectionRef.current || peerConnectionRef.current) {
+      recordDiagnosticEvent("connection_closed");
+    }
+    if (activeFileTransferRef.current) {
+      recordDiagnosticEvent("file_transfer_failed");
+      setTransferStatus(`已断开连接，${activeFileTransferRef.current.fileName} 的续传进度已保留。`);
+    }
     const incomingFile = incomingFileTransferRef.current;
     incomingFileTransferRef.current = null;
     if (incomingFile) {
-      cancelControllerFileReceive(incomingFile.transferId);
+      suspendControllerFileReceive(incomingFile.transferId, incomingFile.writeQueue);
     }
     const socket = connectionRef.current;
     connectionRef.current = null;
@@ -1296,11 +2038,16 @@ function App() {
     controlChannelRef.current = null;
     peerConnectionRef.current = null;
     remoteStreamRef.current = null;
+    remoteAudioStreamRef.current = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     pendingRemoteCandidatesRef.current = [];
     pendingFileSendsRef.current.clear();
+    updateActiveFileTransfer(null);
     clipboardSessionAllowedRef.current = false;
     setPendingClipboardOffer(null);
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    setAudioPlaybackBlocked(false);
+    setAudioStatus("");
     setConnectionDeviceId(null);
     setConnectionStatus("idle");
     setConnectionError("");
@@ -1341,6 +2088,7 @@ function App() {
       setTransferStatus("已发送剪贴板内容，等待对端确认。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("clipboard_sync_failed");
       setTransferStatus(`无法读取剪贴板：${detail}`);
     } finally {
       restoreRemoteFocus();
@@ -1362,6 +2110,7 @@ function App() {
       setAgentClipboardStatus("已发送剪贴板内容，等待控制端确认。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("clipboard_sync_failed");
       setAgentClipboardStatus(`无法发送剪贴板：${detail}`);
     }
   }
@@ -1375,6 +2124,7 @@ function App() {
         setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。");
       } catch (cause) {
         const detail = cause instanceof Error ? cause.message : String(cause);
+        recordDiagnosticEvent("clipboard_sync_failed");
         setTransferStatus(`无法写入剪贴板：${detail}`);
       } finally {
         restoreRemoteFocus();
@@ -1397,6 +2147,7 @@ function App() {
       }
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("clipboard_sync_failed");
       setTransferStatus(`无法写入剪贴板：${detail}`);
     } finally {
       restoreRemoteFocus();
@@ -1442,19 +2193,29 @@ function App() {
         if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("控制连接已关闭。");
         if (accepted) {
           try {
-            await invoke("begin_controller_file_receive", {
+            const resumeOffset = await invoke<number>("begin_controller_file_receive", {
               transferId: offer.transferId,
               fileName: offer.fileName,
               size: offer.size,
+              sha256: offer.sha256,
             });
             incomingFileTransferRef.current = {
               transferId: offer.transferId,
               fileName: offer.fileName,
               size: offer.size,
-              receivedBytes: 0,
+              receivedBytes: resumeOffset,
               writeQueue: Promise.resolve(),
               writeError: null,
             };
+            updateActiveFileTransfer({
+              transferId: offer.transferId,
+              fileName: offer.fileName,
+              size: offer.size,
+              transferred: resumeOffset,
+              paused: false,
+              path: "websocket",
+              mode: "receive",
+            });
           } catch (cause) {
             socket.send(JSON.stringify({
               type: "file_transfer_decision",
@@ -1468,16 +2229,31 @@ function App() {
           type: "file_transfer_decision",
           transfer_id: offer.transferId,
           accepted,
+          resume_offset: accepted
+            ? incomingFileTransferRef.current?.receivedBytes ?? 0
+            : 0,
         }));
       } else {
         await invoke("answer_file_transfer", {
           transferId: offer.transferId,
           accepted,
         });
+        if (accepted) {
+          updateActiveFileTransfer({
+            transferId: offer.transferId,
+            fileName: offer.fileName,
+            size: offer.size,
+            transferred: offer.receivedBytes,
+            paused: false,
+            path: "tauri",
+            mode: "receive",
+          });
+        }
       }
       setTransferStatus(accepted ? `正在接收 ${offer.fileName}…` : `已拒绝接收 ${offer.fileName}。`);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("file_transfer_failed");
       setTransferStatus(`无法处理文件请求：${detail}`);
     } finally {
       restoreRemoteFocus();
@@ -1495,81 +2271,179 @@ function App() {
       setTransferStatus("文件必须大于 0 且不超过 100 MiB。");
       return;
     }
-    const transferId = crypto.randomUUID();
-    pendingFileSendsRef.current.set(transferId, file);
-    socket.send(JSON.stringify({
-      type: "file_offer",
-      transfer_id: transferId,
-      file_name: file.name,
-      size: file.size,
-    }));
-    setTransferStatus(`已请求发送 ${file.name}，等待对端批准。`);
+    try {
+      setTransferStatus(`正在校验 ${file.name}，请稍候…`);
+      const sha256 = await hashFile(file);
+      const targetIdentity = connectionDeviceId ?? activeId ?? "remote-device";
+      const transferId = await getOrCreateFileTransferId(file.name, sha256, targetIdentity);
+      if (connectionRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error("校验完成时连接已关闭；续传标识已保留，请重新连接后再次选择文件。");
+      }
+      pendingFileSendsRef.current.set(transferId, {
+        file,
+        sha256,
+        paused: false,
+        cancelled: false,
+      });
+      updateActiveFileTransfer({
+        transferId,
+        fileName: file.name,
+        size: file.size,
+        transferred: 0,
+        paused: false,
+        path: "websocket",
+        mode: "send",
+      });
+      socket.send(JSON.stringify({
+        type: "file_offer",
+        transfer_id: transferId,
+        file_name: file.name,
+        size: file.size,
+        sha256,
+      }));
+      recordDiagnosticEvent("file_transfer_started");
+      setTransferStatus(`已请求发送 ${file.name}，等待对端批准。`);
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法准备文件续传：${detail}`);
+    }
   }
 
-  async function transmitFile(socket: WebSocket, transferId: string, file: File) {
+  async function transmitFile(socket: WebSocket, transferId: string, file: File, resumeOffset: number) {
+    let offset = resumeOffset;
     try {
       const chunkSize = 48 * 1024;
-      for (let offset = 0; offset < file.size; offset += chunkSize) {
+      while (offset < file.size) {
+        const session = pendingFileSendsRef.current.get(transferId);
+        if (!session) throw new Error("文件传输已取消。");
+        while (session.paused && !session.cancelled) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+        if (session.cancelled) throw new Error("文件传输已取消。");
         while (socket.bufferedAmount > 512 * 1024) {
+          if (session.cancelled) throw new Error("文件传输已取消。");
+          while (session.paused && !session.cancelled) {
+            await new Promise((resolve) => window.setTimeout(resolve, 100));
+          }
           if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
           await new Promise((resolve) => window.setTimeout(resolve, 30));
         }
         const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+        while (session.paused && !session.cancelled) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+        if (session.cancelled) throw new Error("文件传输已取消。");
         if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
         socket.send(chunk);
-        setTransferStatus(`正在发送 ${file.name}：${Math.min(offset + chunk.byteLength, file.size)} / ${file.size} 字节`);
+        offset += chunk.byteLength;
+        const active = activeFileTransferRef.current;
+        if (active?.transferId === transferId) {
+          updateActiveFileTransfer({ ...active, transferred: offset });
+        }
+        setTransferStatus(`正在发送 ${file.name}：${offset} / ${file.size} 字节`);
       }
       socket.send(JSON.stringify({ type: "file_complete", transfer_id: transferId }));
-      pendingFileSendsRef.current.delete(transferId);
+      setTransferStatus(`数据已发送，正在校验并保存 ${file.name}…`);
     } catch (cause) {
       pendingFileSendsRef.current.delete(transferId);
       const detail = cause instanceof Error ? cause.message : String(cause);
-      setTransferStatus(`文件发送失败：${detail}`);
+      if (detail === "文件传输已取消。") {
+        updateActiveFileTransfer(null);
+        setTransferStatus(`已取消 ${file.name}。`);
+        return;
+      }
+      updateActiveFileTransfer(null);
+      recordDiagnosticEvent("file_transfer_failed");
+      setTransferStatus(`文件发送失败：${detail}。续传标识已保留；重连后再次选择同一文件可继续。`);
     }
   }
 
   async function selectAgentFile(file: File | undefined) {
     if (!file || !agentConnected) return;
+    if (file.size === 0 || file.size > 100 * 1024 * 1024) {
+      setAgentClipboardStatus("文件必须大于 0 且不超过 100 MiB。");
+      return;
+    }
     if (pendingAgentFileRef.current) {
       setAgentClipboardStatus("已有文件正在等待发送或传输，请完成后再试。");
       return;
     }
-    const transferId = crypto.randomUUID();
-    pendingAgentFileRef.current = { transferId, file };
     try {
+      setAgentClipboardStatus(`正在校验 ${file.name}，请稍候…`);
+      const sha256 = await hashFile(file);
+      const targetIdentity = agentPeerIdentityRef.current || "unknown-controller";
+      const transferId = await getOrCreateFileTransferId(file.name, sha256, targetIdentity);
+      if (!agentConnected) throw new Error("校验完成时被控端连接已断开。");
+      pendingAgentFileRef.current = { transferId, file, sha256, paused: false, cancelled: false };
+      recordDiagnosticEvent("file_transfer_started");
+      updateActiveFileTransfer({
+        transferId,
+        fileName: file.name,
+        size: file.size,
+        transferred: 0,
+        paused: false,
+        path: "tauri",
+        mode: "send",
+      });
       await invoke("begin_agent_file_transfer", {
         transferId,
         fileName: file.name,
         size: file.size,
+        sha256,
       });
       setAgentClipboardStatus(`已请求发送 ${file.name}，等待控制端批准。`);
     } catch (cause) {
-      if (pendingAgentFileRef.current?.transferId === transferId) {
-        pendingAgentFileRef.current = null;
-      }
+      pendingAgentFileRef.current = null;
+      updateActiveFileTransfer(null);
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentClipboardStatus(`无法发送文件：${detail}`);
     }
   }
 
-  async function transmitAgentFile(transferId: string, file: File) {
+  async function transmitAgentFile(transferId: string, file: File, resumeOffset: number) {
+    let offset = resumeOffset;
+    let awaitingCompletion = false;
     try {
       const chunkSize = 48 * 1024;
-      for (let offset = 0; offset < file.size; offset += chunkSize) {
+      while (offset < file.size) {
+        const session = pendingAgentFileRef.current;
+        if (!session || session.transferId !== transferId) throw new Error("文件传输已取消。");
+        while (session.paused && !session.cancelled) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+        if (session.cancelled) throw new Error("文件传输已取消。");
         const chunk = new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer());
+        while (session.paused && !session.cancelled) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+        }
+        if (session.cancelled) throw new Error("文件传输已取消。");
         await invoke("send_agent_file_chunk", {
           transferId,
           bytes: Array.from(chunk),
         });
-        setAgentClipboardStatus(`正在发送 ${file.name}：${Math.min(offset + chunk.byteLength, file.size)} / ${file.size} 字节`);
+        offset += chunk.byteLength;
+        const active = activeFileTransferRef.current;
+        if (active?.transferId === transferId) {
+          updateActiveFileTransfer({ ...active, transferred: offset });
+        }
+        setAgentClipboardStatus(`正在发送 ${file.name}：${offset} / ${file.size} 字节`);
       }
       await invoke("finish_agent_file_transfer", { transferId });
-      setAgentClipboardStatus(`已发送 ${file.name}，等待控制端保存完成。`);
+      awaitingCompletion = true;
+      setAgentClipboardStatus(`数据已发送，正在校验并保存 ${file.name}…`);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
-      setAgentClipboardStatus(`文件发送失败：${detail}`);
+      if (detail === "文件传输已取消。") {
+        setAgentClipboardStatus(`已取消 ${file.name}。`);
+      } else {
+        recordDiagnosticEvent("file_transfer_failed");
+        setAgentClipboardStatus(`文件发送失败：${detail}。续传标识已保留；连接恢复后再次选择同一文件可继续。`);
+      }
     } finally {
-      pendingAgentFileRef.current = null;
+      if (!awaitingCompletion) {
+        pendingAgentFileRef.current = null;
+        updateActiveFileTransfer(null);
+      }
     }
   }
 
@@ -1578,8 +2452,9 @@ function App() {
     if (!incoming || incoming.transferId !== transferId || incoming.receivedBytes !== incoming.size) {
       incomingFileTransferRef.current = null;
       if (incoming) {
-        cancelControllerFileReceive(incoming.transferId);
+        suspendControllerFileReceive(incoming.transferId, incoming.writeQueue);
       }
+      notifyFileTransferError(socket, transferId, "文件数据未完整，续传进度已保留。");
       setTransferStatus("文件传输未完整，无法保存。");
       return;
     }
@@ -1589,20 +2464,103 @@ function App() {
       if (incoming.writeError) throw new Error(incoming.writeError);
       const savedPath = await invoke<string>("finish_controller_file_receive", { transferId });
       socket.send(JSON.stringify({ type: "file_transfer_complete", transfer_id: transferId }));
+      updateActiveFileTransfer(null);
+      recordDiagnosticEvent("file_transfer_completed");
       setTransferStatus(`已接收 ${incoming.fileName}，保存至 ${savedPath}`);
     } catch (cause) {
-      cancelControllerFileReceive(transferId);
+      suspendControllerFileReceive(transferId);
+      updateActiveFileTransfer(null);
       const detail = cause instanceof Error ? cause.message : String(cause);
-      setTransferStatus(`接收文件失败：${detail}`);
+      recordDiagnosticEvent("file_transfer_failed");
+      setTransferStatus(`接收文件失败：${detail}。已接收数据已保留，可重新连接后续传。`);
+      notifyFileTransferError(socket, transferId, detail);
     }
   }
 
-  function cancelControllerFileReceive(transferId: string) {
-    void invoke("cancel_controller_file_receive", { transferId })
+  function cancelControllerFileReceive(transferId: string, writeQueue: Promise<void> = Promise.resolve()) {
+    void writeQueue.then(() => invoke("cancel_controller_file_receive", { transferId }))
       .catch((cause: unknown) => {
         const detail = cause instanceof Error ? cause.message : String(cause);
         setTransferStatus(`无法清理未完成文件：${detail}`);
       });
+  }
+
+  function suspendControllerFileReceive(transferId: string, writeQueue: Promise<void> = Promise.resolve()) {
+    void writeQueue.then(() => invoke("suspend_controller_file_receive", { transferId }))
+      .catch((cause: unknown) => {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setTransferStatus(`无法保存文件续传进度：${detail}`);
+      });
+  }
+
+  function notifyFileTransferError(socket: WebSocket, transferId: string, message: string) {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify({ type: "file_transfer_error", transfer_id: transferId, message }));
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法通知对端文件接收失败：${detail}`);
+    }
+  }
+
+  async function controlActiveFileTransfer(action: "pause" | "resume" | "cancel") {
+    const active = activeFileTransferRef.current;
+    if (!active) return;
+    const session = active.path === "websocket"
+      ? pendingFileSendsRef.current.get(active.transferId)
+      : pendingAgentFileRef.current?.transferId === active.transferId
+        ? pendingAgentFileRef.current
+        : null;
+    if (session && action !== "cancel") session.paused = action === "pause";
+    if (session?.cancelled) return;
+    if (session && action === "cancel") session.cancelled = true;
+
+    try {
+      if (active.path === "websocket") {
+        const socket = connectionRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("控制连接已关闭。");
+        socket.send(JSON.stringify({
+          type: "file_transfer_control",
+          transfer_id: active.transferId,
+          action,
+        }));
+      } else {
+        await invoke("control_agent_file_transfer", {
+          transferId: active.transferId,
+          action,
+        });
+      }
+
+      if (action === "cancel") {
+        if (active.mode === "send") {
+          const sendingSession = active.path === "websocket"
+            ? pendingFileSendsRef.current.get(active.transferId)
+            : pendingAgentFileRef.current?.transferId === active.transferId
+              ? pendingAgentFileRef.current
+              : null;
+          if (sendingSession) clearFileTransferIdentity(active.transferId);
+          pendingFileSendsRef.current.delete(active.transferId);
+          if (pendingAgentFileRef.current?.transferId === active.transferId) {
+            pendingAgentFileRef.current = null;
+          }
+        } else if (active.path === "websocket") {
+          const incoming = incomingFileTransferRef.current;
+          if (incoming?.transferId === active.transferId) {
+            incomingFileTransferRef.current = null;
+            cancelControllerFileReceive(active.transferId, incoming.writeQueue);
+          }
+        }
+        updateActiveFileTransfer(null);
+        setTransferStatus(`已取消 ${active.fileName} 的文件传输。`);
+      } else {
+        updateActiveFileTransfer({ ...active, paused: action === "pause" });
+        setTransferStatus(action === "pause" ? `已暂停 ${active.fileName}。` : `已继续 ${active.fileName}。`);
+      }
+    } catch (cause) {
+      if (session) session.paused = false;
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      setTransferStatus(`无法${action === "pause" ? "暂停" : action === "resume" ? "继续" : "取消"}文件传输：${detail}`);
+    }
   }
 
   function sendInput(message: Record<string, string | number | boolean>) {
@@ -1896,9 +2854,45 @@ function App() {
             </div>
           )}
           {agentClipboardStatus && <div className="transfer-status agent-clipboard-status" role="status">{agentClipboardStatus}</div>}
+          {activeFileTransfer && (
+            <div className="file-transfer-controls" role="group" aria-label="文件传输控制">
+              <div className="file-transfer-progress">
+                <strong>{activeFileTransfer.fileName}</strong>
+                <span>
+                  {activeFileTransfer.paused ? "已暂停" : activeFileTransfer.mode === "send" ? "正在发送" : "正在接收"}
+                  {" · "}
+                  {activeFileTransfer.transferred.toLocaleString()} / {activeFileTransfer.size.toLocaleString()} 字节
+                </span>
+                <progress value={activeFileTransfer.transferred} max={activeFileTransfer.size} />
+              </div>
+              <button
+                className="secondary-button"
+                onClick={() => void controlActiveFileTransfer(activeFileTransfer.paused ? "resume" : "pause")}
+                type="button"
+              >
+                {activeFileTransfer.paused ? "继续" : "暂停"}
+              </button>
+              <button
+                className="transfer-cancel-button"
+                onClick={() => void controlActiveFileTransfer("cancel")}
+                type="button"
+              >
+                取消传输
+              </button>
+            </div>
+          )}
           {connectionStatus === "error" && connectionError && (
             <div className="connection-error" role="alert">
               <span>{connectionError}</span>
+              {activeDevice && (
+                <button
+                  className="text-button"
+                  onClick={() => connectToDevice(activeDevice)}
+                  type="button"
+                >
+                  重试连接
+                </button>
+              )}
               <button className="text-button" onClick={() => disconnectFromDevice()} type="button">关闭</button>
             </div>
           )}
@@ -2007,6 +3001,21 @@ function App() {
                           height: event.currentTarget.videoHeight,
                         })}
                       />
+                      <audio autoPlay className="remote-audio" playsInline ref={remoteAudioRef} />
+                      {playRemoteSystemAudio && audioStatus && (
+                        <div
+                          className="remote-audio-status"
+                          onPointerDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                        >
+                          <span>{audioStatus}</span>
+                          {audioPlaybackBlocked && (
+                            <button onClick={playRemoteAudio} type="button">播放声音</button>
+                          )}
+                        </div>
+                      )}
                       <span className="remote-live">
                         <span className="lan-status-dot" />
                         WebRTC · {encoderStatus || "编码器检测中"} · {standaloneDeviceId ? "鼠标和键盘可控" : "只读预览"}
@@ -2171,6 +3180,20 @@ function App() {
                       {openDeviceMenuId === device.id && (
                         <div className="device-menu" role="menu">
                           <button
+                            className="menu-edit"
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setOpenDeviceMenuId(null);
+                              setEditingDevice(device);
+                              setName(device.name);
+                              setAddress(device.address);
+                              setError("");
+                            }}
+                          >
+                            编辑设备信息…
+                          </button>
+                          <button
                             type="button"
                             role="menuitem"
                             onClick={() => {
@@ -2210,28 +3233,56 @@ function App() {
         </div>
       </section>
 
-      {isAdding && (
+      {(isAdding || editingDevice) && (
         <div
           className="modal-backdrop"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setIsAdding(false);
+            if (event.target === event.currentTarget) closeDeviceForm();
           }}
         >
-          <form className="device-dialog" onSubmit={addDevice}>
+          <form className="device-dialog" onSubmit={saveDevice}>
             <button
               className="dialog-close icon-button"
               type="button"
               aria-label="关闭"
-              onClick={() => {
-                setIsAdding(false);
-                setError("");
-              }}
+              onClick={closeDeviceForm}
             >
               <Icon name="close" />
             </button>
             <span className="dialog-icon"><Icon name="desktop" /></span>
-            <h2>添加局域网设备</h2>
+            <h2>{editingDevice ? "编辑设备信息" : "添加局域网设备"}</h2>
             <p>输入远程电脑的名称和局域网地址。两台设备需处于同一网络。</p>
+            {!editingDevice && (
+              <div className="device-discovery">
+                <button
+                  className="secondary-button"
+                  disabled={isDiscovering}
+                  onClick={() => void discoverDevices()}
+                  type="button"
+                >
+                  {isDiscovering ? "正在扫描…" : "扫描局域网设备"}
+                </button>
+                {discoveryStatus && <p role="status">{discoveryStatus}</p>}
+                {discoveredDevices.length > 0 && (
+                  <div className="discovered-device-list">
+                    {discoveredDevices.map((device) => (
+                      <button
+                        key={device.address}
+                        onClick={() => {
+                          setName(device.name);
+                          setAddress(device.address);
+                          setError("");
+                        }}
+                        type="button"
+                      >
+                        <strong>{device.name}</strong>
+                        <span>{device.address}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <label htmlFor="device-name">设备名称</label>
             <input
               autoFocus
@@ -2253,15 +3304,14 @@ function App() {
             <div className="dialog-actions">
               <button
                 className="secondary-button"
-                onClick={() => {
-                  setIsAdding(false);
-                  setError("");
-                }}
+                onClick={closeDeviceForm}
                 type="button"
               >
                 取消
               </button>
-              <button className="primary-button" type="submit">保存设备</button>
+              <button className="primary-button" type="submit">
+                {editingDevice ? "保存修改" : "保存设备"}
+              </button>
             </div>
           </form>
         </div>
@@ -2273,135 +3323,280 @@ function App() {
             if (event.target === event.currentTarget) setShowSettings(false);
           }}
         >
-          <section className="device-dialog settings-dialog" aria-labelledby="settings-title">
-            <button
-              className="dialog-close icon-button"
-              type="button"
-              aria-label="关闭"
-              onClick={() => setShowSettings(false)}
-            >
-              <Icon name="close" />
-            </button>
-            <span className="dialog-icon"><Icon name="settings" /></span>
-            <h2 id="settings-title">应用设置</h2>
-            <p>画质偏好会在下一次连接时应用到被控端。</p>
-            <fieldset className="quality-options">
-              <legend>远程画面偏好</legend>
-              <label className={videoQuality === "quality" ? "quality-option selected" : "quality-option"}>
-                <input
-                  checked={videoQuality === "quality"}
-                  name="video-quality"
-                  onChange={() => setVideoQuality("quality")}
-                  type="radio"
-                  value="quality"
-                />
-                <span>
-                  <strong>画质优先</strong>
-                  <small>更高分辨率和码率，可能增加带宽与编码负载。</small>
-                </span>
-              </label>
-              <label className={videoQuality === "balanced" ? "quality-option selected" : "quality-option"}>
-                <input
-                  checked={videoQuality === "balanced"}
-                  name="video-quality"
-                  onChange={() => setVideoQuality("balanced")}
-                  type="radio"
-                  value="balanced"
-                />
-                <span>
-                  <strong>平衡</strong>
-                  <small>默认画面尺寸与帧率，兼顾清晰度和响应。</small>
-                </span>
-              </label>
-              <label className={videoQuality === "smooth" ? "quality-option selected" : "quality-option"}>
-                <input
-                  checked={videoQuality === "smooth"}
-                  name="video-quality"
-                  onChange={() => setVideoQuality("smooth")}
-                  type="radio"
-                  value="smooth"
-                />
-                <span>
-                  <strong>流畅度优先</strong>
-                  <small>提高目标帧率并降低分辨率上限，适合动作较多的画面。</small>
-                </span>
-              </label>
-            </fieldset>
-            <label className="clipboard-setting">
-              <input
-                checked={clipboardEnabled}
-                disabled={clipboardSettingLocked}
-                onChange={(event) => setClipboardEnabled(event.currentTarget.checked)}
-                type="checkbox"
-              />
-              <span>
-                <strong>启用双向自动剪贴板同步</strong>
-                <small>两端都启用后，复制的文本会自动同步。接收方首次确认后，本次连接内后续内容自动写入；断开后重新询问。仍可使用远程工具栏手动发送。</small>
-              </span>
-            </label>
-            <fieldset className="quality-options close-behavior-options">
-              <legend>关闭窗口时</legend>
-              <label className={closeToTray ? "quality-option selected" : "quality-option"}>
-                <input
-                  checked={closeToTray}
-                  disabled={savingCloseToTray}
-                  name="close-behavior"
-                  onChange={() => void updateCloseToTray(true)}
-                  type="radio"
-                  value="tray"
-                />
-                <span>
-                  <strong>最小化到系统托盘</strong>
-                  <small>远程服务继续运行，可从托盘菜单重新打开或退出。</small>
-                </span>
-              </label>
-              <label className={!closeToTray ? "quality-option selected" : "quality-option"}>
-                <input
-                  checked={!closeToTray}
-                  disabled={savingCloseToTray}
-                  name="close-behavior"
-                  onChange={() => void updateCloseToTray(false)}
-                  type="radio"
-                  value="quit"
-                />
-                <span>
-                  <strong>彻底退出应用</strong>
-                  <small>关闭窗口时退出 Lantern，并停止被控端服务。</small>
-                </span>
-              </label>
-              {closeToTrayError && <p className="form-error" role="alert">{closeToTrayError}</p>}
-            </fieldset>
-            <section className="trusted-devices-section">
-              <h3>信任设备</h3>
-              <p>信任后，同一 IP 的连接请求将自动获批。仅信任你控制的设备。</p>
-              {trustedDevicesError && <p className="form-error" role="alert">{trustedDevicesError}</p>}
-              {trustedDevices.length === 0 ? (
-                <p className="trusted-empty">没有已信任的设备。</p>
-              ) : (
-                <ul className="trusted-device-list">
-                  {trustedDevices.map((device) => (
-                    <li key={device.ipAddress}>
-                      <code>{device.ipAddress}</code>
-                      <button
-                        className="text-button"
-                        type="button"
-                        onClick={() => void removeTrustedDevice(device.ipAddress)}
-                      >
-                        移除
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </section>
-            <div className="dialog-actions">
+          <section className="settings-dialog settings-layout" aria-labelledby="settings-title">
+            <nav className="settings-sidebar" aria-label="设置栏目">
+              <h2 id="settings-title">应用设置</h2>
+              <div className="settings-navigation">
+                {([
+                  ["video", "画面与控制"],
+                  ["audio", "声音"],
+                  ["clipboard", "剪贴板"],
+                  ["window", "窗口行为"],
+                  ["trusted", "信任设备"],
+                  ["diagnostics", "诊断日志"],
+                ] as const).map(([section, label]) => (
+                  <button
+                    key={section}
+                    className={settingsSection === section ? "settings-navigation-item selected" : "settings-navigation-item"}
+                    type="button"
+                    aria-current={settingsSection === section ? "page" : undefined}
+                    onClick={() => {
+                      setSettingsSection(section);
+                      if (section === "diagnostics") void refreshDiagnosticLog();
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               <button
-                className="primary-button"
+                className="secondary-button settings-close-button"
                 onClick={() => setShowSettings(false)}
                 type="button"
               >
                 完成
               </button>
+            </nav>
+            <div className="settings-page">
+              <button
+                className="dialog-close icon-button"
+                type="button"
+                aria-label="关闭设置"
+                onClick={() => setShowSettings(false)}
+              >
+                <Icon name="close" />
+              </button>
+              {settingsSection === "video" && (
+                <div className="settings-page-content">
+                  <h3>画面与控制</h3>
+                  <p>显示器和画质设置会在下一次连接时应用到被控端。</p>
+                  <label className="settings-select-label" htmlFor="capture-display">被控端显示器</label>
+                  <select
+                    className="settings-select"
+                    id="capture-display"
+                    value={selectedDisplayId ?? ""}
+                    onChange={(event) => {
+                      const value = event.currentTarget.value;
+                      setSelectedDisplayId(value === "" ? null : Number(value));
+                    }}
+                  >
+                    <option value="">自动（主显示器）</option>
+                    {availableDisplays.map((display) => (
+                      <option key={display.id} value={display.id}>
+                        {display.name} · {display.width} × {display.height}
+                      </option>
+                    ))}
+                  </select>
+                  {displaySettingsError && <p className="form-error" role="alert">{displaySettingsError}</p>}
+                  {!isTauri() && <p className="settings-note">显示器选择仅在 Lantern 桌面应用中可用。</p>}
+                  <fieldset className="quality-options">
+                    <legend>远程画面偏好</legend>
+                    <label className={videoQuality === "quality" ? "quality-option selected" : "quality-option"}>
+                      <input
+                        checked={videoQuality === "quality"}
+                        name="video-quality"
+                        onChange={() => setVideoQuality("quality")}
+                        type="radio"
+                        value="quality"
+                      />
+                      <span>
+                        <strong>画质优先</strong>
+                        <small>更高分辨率和码率，可能增加带宽与编码负载。</small>
+                      </span>
+                    </label>
+                    <label className={videoQuality === "balanced" ? "quality-option selected" : "quality-option"}>
+                      <input
+                        checked={videoQuality === "balanced"}
+                        name="video-quality"
+                        onChange={() => setVideoQuality("balanced")}
+                        type="radio"
+                        value="balanced"
+                      />
+                      <span>
+                        <strong>平衡</strong>
+                        <small>默认画面尺寸与帧率，兼顾清晰度和响应。</small>
+                      </span>
+                    </label>
+                    <label className={videoQuality === "smooth" ? "quality-option selected" : "quality-option"}>
+                      <input
+                        checked={videoQuality === "smooth"}
+                        name="video-quality"
+                        onChange={() => setVideoQuality("smooth")}
+                        type="radio"
+                        value="smooth"
+                      />
+                      <span>
+                        <strong>流畅度优先</strong>
+                        <small>提高目标帧率并降低分辨率上限，适合动作较多的画面。</small>
+                      </span>
+                    </label>
+                  </fieldset>
+                  <section className="settings-guidance" aria-labelledby="permission-guidance-title">
+                    <h4 id="permission-guidance-title">系统权限提示</h4>
+                    <p><strong>macOS：</strong>需要为 Lantern 开启“屏幕录制”和“辅助功能”权限；修改权限后可能需要重启应用。</p>
+                    <p><strong>Windows：</strong>远程控制受 UAC 安全桌面和权限级别限制；建议两端应用以相同权限运行。</p>
+                    <p><strong>Linux：</strong>屏幕采集和键鼠控制取决于桌面会话；Wayland 支持因桌面环境而异，遇到问题可尝试 X11 会话。</p>
+                  </section>
+                </div>
+              )}
+              {settingsSection === "clipboard" && (
+                <div className="settings-page-content">
+                  <h3>剪贴板</h3>
+                  <p>自动同步仅传输文本，两端均需启用。</p>
+                  <label className="clipboard-setting settings-clipboard-setting">
+                    <input
+                      checked={clipboardEnabled}
+                      disabled={clipboardSettingLocked}
+                      onChange={(event) => setClipboardEnabled(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>启用双向自动剪贴板同步</strong>
+                      <small>接收方首次确认后，本次连接内后续内容自动写入；断开后重新询问。仍可使用远程工具栏手动发送。</small>
+                    </span>
+                  </label>
+                  {clipboardSettingLocked && (
+                    <p className="settings-note">连接或被控服务运行期间无法修改此选项，请先断开连接并停止被控端。</p>
+                  )}
+                </div>
+              )}
+              {settingsSection === "audio" && (
+                <div className="settings-page-content">
+                  <h3>系统声音</h3>
+                  <p>仅将被控端的系统输出声音单向传到控制端，不共享麦克风。默认关闭；播放和分享分别控制。</p>
+                  <label className="clipboard-setting settings-clipboard-setting">
+                    <input
+                      checked={playRemoteSystemAudio}
+                      disabled={playRemoteAudioSettingLocked || !isTauri()}
+                      onChange={(event) => setPlayRemoteSystemAudio(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>在本机播放远端系统声音</strong>
+                      <small>此选项仅控制端需要开启，下一次连接时生效。</small>
+                    </span>
+                  </label>
+                  <label className="clipboard-setting settings-clipboard-setting">
+                    <input
+                      checked={shareSystemAudio}
+                      disabled={shareSystemAudioSettingLocked || !isTauri()}
+                      onChange={(event) => setShareSystemAudio(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>允许本机系统声音共享</strong>
+                      <small>此选项仅被控端需要开启。仅在控制端请求声音且本项开启时采集，不会共享麦克风。</small>
+                    </span>
+                  </label>
+                  {audioStatus && <p className="settings-note" role="status">{audioStatus}</p>}
+                  {!isTauri() && <p className="settings-note">系统声音传输仅在 Lantern 桌面应用中可用。</p>}
+                  {playRemoteAudioSettingLocked && (
+                    <p className="settings-note">控制端连接期间无法修改播放选项，请先断开连接。</p>
+                  )}
+                  {shareSystemAudioSettingLocked && (
+                    <p className="settings-note">被控端连接请求或会话进行期间无法修改共享选项。</p>
+                  )}
+                  <section className="permission-notes">
+                    <p><strong>macOS：</strong>需要 macOS 14.4 或更新版本，并在首次提示时允许音频采集；macOS 13–14.3 仍可远程控制，但不支持系统声音传输。</p>
+                    <p><strong>Windows：</strong>若系统隐私设置阻止音频捕获，请在 Windows 隐私设置中允许 Lantern。</p>
+                    <p><strong>Linux：</strong>系统声音捕获需要正在运行的 PipeWire 会话。</p>
+                  </section>
+                </div>
+              )}
+              {settingsSection === "window" && (
+                <div className="settings-page-content">
+                  <h3>窗口行为</h3>
+                  <p>设置关闭主窗口时 Lantern 的行为。</p>
+                  <fieldset className="quality-options">
+                    <legend>关闭主窗口时</legend>
+                    <label className={closeToTray ? "quality-option selected" : "quality-option"}>
+                      <input
+                        checked={closeToTray}
+                        disabled={savingCloseToTray}
+                        name="close-behavior"
+                        onChange={() => void updateCloseToTray(true)}
+                        type="radio"
+                        value="tray"
+                      />
+                      <span>
+                        <strong>最小化到系统托盘</strong>
+                        <small>远程服务继续运行，可从托盘菜单重新打开或退出。</small>
+                      </span>
+                    </label>
+                    <label className={!closeToTray ? "quality-option selected" : "quality-option"}>
+                      <input
+                        checked={!closeToTray}
+                        disabled={savingCloseToTray}
+                        name="close-behavior"
+                        onChange={() => void updateCloseToTray(false)}
+                        type="radio"
+                        value="quit"
+                      />
+                      <span>
+                        <strong>彻底退出应用</strong>
+                        <small>关闭窗口时退出 Lantern，并停止被控端服务。</small>
+                      </span>
+                    </label>
+                    {closeToTrayError && <p className="form-error" role="alert">{closeToTrayError}</p>}
+                  </fieldset>
+                </div>
+              )}
+              {settingsSection === "trusted" && (
+                <div className="settings-page-content">
+                  <h3>信任设备</h3>
+                  <p>信任后，同一 IP 的连接请求将自动获批。仅信任你控制的设备。</p>
+                  <section className="trusted-devices-section">
+                    {trustedDevicesError && <p className="form-error" role="alert">{trustedDevicesError}</p>}
+                    {trustedDevices.length === 0 ? (
+                      <p className="trusted-empty">没有已信任的设备。</p>
+                    ) : (
+                      <ul className="trusted-device-list">
+                        {trustedDevices.map((device) => (
+                          <li key={device.ipAddress}>
+                            <code>{device.ipAddress}</code>
+                            <button
+                              className="text-button"
+                              type="button"
+                              onClick={() => void removeTrustedDevice(device.ipAddress)}
+                            >
+                              移除
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                </div>
+              )}
+              {settingsSection === "diagnostics" && (
+                <div className="settings-page-content">
+                  <h3>诊断日志</h3>
+                  <p>仅记录连接、被控服务和传输的状态事件，不记录设备地址、文件名、剪贴板内容或屏幕内容。日志保存在本机。</p>
+                  {diagnosticLogError && <p className="form-error" role="alert">{diagnosticLogError}</p>}
+                  {!isTauri() ? (
+                    <p className="settings-note">诊断日志仅在 Lantern 桌面应用中可用。</p>
+                  ) : (
+                    <>
+                      <div className="diagnostic-actions">
+                        <button className="secondary-button" onClick={() => void refreshDiagnosticLog()} type="button">
+                          刷新
+                        </button>
+                        <button
+                          className="secondary-button"
+                          disabled={!diagnosticLog}
+                          onClick={() => void copyDiagnosticLog()}
+                          type="button"
+                        >
+                          复制日志
+                        </button>
+                      </div>
+                      <pre className="diagnostic-log" aria-label="本机诊断日志">
+                        {diagnosticLog || "暂无诊断记录。"}
+                      </pre>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           </section>
         </div>
@@ -2454,11 +3649,16 @@ function App() {
             <h2 id="file-offer-title">接收文件？</h2>
             <p>
               对端请求发送 <strong>{pendingFileOffer.fileName}</strong>（{(pendingFileOffer.size / 1024 / 1024).toFixed(2)} MiB）。
+              {pendingFileOffer.receivedBytes > 0
+                ? ` 已接收 ${pendingFileOffer.receivedBytes.toLocaleString()} 字节，接受后将从断点继续。`
+                : ""}
               接受后将保存到“下载/Lantern Received”目录。
             </p>
             <div className="dialog-actions">
               <button className="secondary-button" onClick={() => void answerFileOffer(false)} type="button">拒绝</button>
-              <button className="primary-button" onClick={() => void answerFileOffer(true)} type="button">接受文件</button>
+              <button className="primary-button" onClick={() => void answerFileOffer(true)} type="button">
+                {pendingFileOffer.receivedBytes > 0 ? "继续接收" : "接受文件"}
+              </button>
             </div>
           </section>
         </div>
