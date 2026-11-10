@@ -25,15 +25,15 @@
 body {
   margin: 0;
   min-width: 680px;
-  min-height: 100vh;
   background: var(--bg);
 }
 
+html, body, #root { width: 100%; height: 100%; min-height: 0; overflow: hidden; }
 button, input { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-.app-shell { display: flex; width: 100%; height: 100vh; min-height: 0; overflow: hidden; }
+.app-shell { display: flex; width: 100%; height: 100%; min-height: 0; overflow: hidden; }
 .native-fullscreen-document, .native-fullscreen-document body, .native-fullscreen-document #root {
   width: 100%;
   height: 100%;
@@ -250,8 +250,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .help-button { width: 29px; height: 29px; }
 .help-button svg { width: 17px; }
 .top-avatar { width: 29px; height: 29px; font-size: 11px; }
-.workspace { display: flex; width: 100%; max-width: 1250px; min-height: 0; flex: 1; flex-direction: column; margin: 0 auto; padding: 44px 48px 22px; overflow: hidden; }
-.page-heading { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 27px; }
+.workspace { display: flex; width: 100%; max-width: 1250px; min-height: 0; flex: 1; flex-direction: column; margin: 0 auto; padding: 20px 48px 18px; overflow: hidden; }
+.page-heading { display: flex; flex: 0 0 auto; align-items: flex-end; justify-content: space-between; margin-bottom: 20px; }
 .heading-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .eyebrow { display: flex; align-items: center; gap: 8px; margin-bottom: 11px; color: #879183; font: 10px "DM Mono", monospace; letter-spacing: 1.05px; }
 .eyebrow > span { width: 6px; height: 6px; }
@@ -279,20 +279,22 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .primary-button svg, .secondary-button svg { width: 16px; height: 16px; flex: 0 0 16px; }
 .notice {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 12px;
-  min-height: 53px;
-  margin-bottom: 38px;
-  padding: 10px 14px;
+  min-height: 36px;
+  margin: 0 0 18px;
+  padding: 6px 9px;
   background: #1b2019;
   border: 1px solid #2c3725;
-  border-radius: 9px;
+  border-radius: 7px;
+  order: -1;
 }
-.notice-icon { display: grid; place-items: center; width: 23px; height: 23px; flex: 0 0 23px; color: #b6e68f; background: #2a3822; border-radius: 7px; }
-.notice-icon svg { width: 14px; height: 14px; }
-.notice p { flex: 1; margin: 0; color: #9da892; font-size: 11px; line-height: 1.5; }
+.notice-icon { display: grid; place-items: center; width: 18px; height: 18px; flex: 0 0 18px; color: #b6e68f; background: #2a3822; border-radius: 5px; }
+.notice-icon svg { width: 12px; height: 12px; }
+.notice p { flex: 1; margin: 0; color: #9da892; font-size: 10px; line-height: 1.4; }
 .notice strong { margin-right: 6px; color: #c6d8b8; font-weight: 600; }
-.notice-tag { padding: 4px 8px; color: #a4bd8d; background: #273122; border-radius: 5px; font: 10px "DM Mono", monospace; }
+.notice-tag { padding: 3px 6px; color: #a4bd8d; background: #273122; border-radius: 4px; font: 9px "DM Mono", monospace; }
 .storage-error { margin: -26px 0 30px; padding: 10px 12px; color: #f1aaa3; background: #2b1d1d; border: 1px solid #57302e; border-radius: 7px; font-size: 11px; }
 .agent-status, .connection-error { display: flex; align-items: center; gap: 9px; margin: -25px 0 30px; padding: 10px 12px; color: #aab2bd; background: #1b1e24; border: 1px solid #2c323b; border-radius: 8px; font-size: 10px; }
 .agent-status-on { color: #bed5aa; background: #1a2118; border-color: #34442b; }
@@ -301,7 +303,7 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .agent-clipboard-status { margin: -20px 0 24px; }
 .connection-error { justify-content: space-between; color: #f0aaa3; background: #2b1d1d; border-color: #57302e; }
 .text-button { padding: 3px 6px; color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 10px; }
-.desktop-heading { margin-bottom: 15px; }
+.desktop-heading { flex: 0 0 auto; margin-bottom: 12px; }
 .desktop-heading h2 { margin: 0 0 5px; color: #dfe4ea; font: 600 14px "Manrope", sans-serif; letter-spacing: -.2px; }
 .heading-count { margin-left: 4px; color: #858d98; font: 11px "DM Mono", monospace; }
 .desktop-heading p { margin: 0; color: #7e8793; font-size: 11px; }
@@ -341,7 +343,7 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .empty-cta { min-height: 36px; padding: 0 13px; font-size: 11px; }
 .empty-footnote { display: flex; align-items: center; gap: 5px; margin-top: 13px; color: #707985; font-size: 9px; }
 .empty-footnote svg { width: 12px; height: 12px; color: #8eaa78; }
-.device-grid { display: grid; min-height: 0; flex: 1; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 16px; overflow-y: auto; overscroll-behavior: contain; }
+.device-grid { display: grid; min-height: 0; flex: 1; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); grid-auto-rows: max-content; align-content: start; gap: 16px; overflow-y: auto; overscroll-behavior: contain; }
 .device-grid.layout-tile { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .device-grid.layout-list { grid-template-columns: 1fr; gap: 9px; }
 .layout-toggle { display: flex; gap: 3px; padding: 3px; background: #171a20; border: 1px solid #292e37; border-radius: 8px; }
@@ -459,7 +461,7 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .transfer-cancel-button:hover { background: #402a28; }
 .danger-button { min-height: 36px; padding: 0 13px; color: #fff0ee; background: #8e3937; border: 1px solid #ae514c; border-radius: 7px; cursor: pointer; font-size: 11px; font-weight: 600; }
 .danger-button:hover { background: #a24440; }
-.selection-bar { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; margin-top: 16px; padding: 10px 12px; color: #aab3bf; background: #191c22; border: 1px solid #292e37; border-radius: 8px; font-size: 10px; }
+.selection-bar { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; margin-top: 12px; padding: 10px 12px; color: #aab3bf; background: #191c22; border: 1px solid #292e37; border-radius: 8px; font-size: 10px; }
 .selection-check { display: grid; place-items: center; width: 17px; height: 17px; color: #b8e695; background: #2a3921; border-radius: 50%; }
 .selection-check svg { width: 11px; height: 11px; }
 .selection-bar strong { color: #e0e5eb; }
