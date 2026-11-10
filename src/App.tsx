@@ -102,6 +102,7 @@ type DiagnosticEvent =
   | "clipboard_text_sent"
   | "clipboard_text_received"
   | "audio_inbound_rtp_stats"
+  | "audio_inbound_rtp_missing"
   | "audio_inbound_stats_read_failed"
   | "audio_remote_track_received"
   | "audio_remote_track_unmuted"
@@ -704,7 +705,11 @@ function App() {
             : "控制端尚未收到远端音频 RTP 数据。",
         );
         if (Date.now() - lastStatsLogAt >= 15_000) {
-          recordDiagnosticEvent("audio_inbound_rtp_stats", packetsReceived, bytesReceived);
+          if (receivedAudio) {
+            recordDiagnosticEvent("audio_inbound_rtp_stats", packetsReceived, bytesReceived);
+          } else {
+            recordDiagnosticEvent("audio_inbound_rtp_missing");
+          }
           lastStatsLogAt = Date.now();
         }
       } catch (cause) {
