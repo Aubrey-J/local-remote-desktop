@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -23,11 +23,13 @@ use axum::{
     routing::get,
 };
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use if_addrs::{IfAddr, get_if_addrs};
 use image::imageops::FilterType;
 use reactor_webrtc::{
     AudioFrame, AudioTrack, AudioTrackOptions, AudioTrackSource, IceCandidate, MediaKind,
     PeerConnection, PeerConnectionFactory, PeerConnectionObserver, PeerConnectionState,
-    RtcConfiguration, SdpType, SessionDescription, StreamKind, VideoCodec, VideoFrame,
+    RtcConfiguration, SdpType, SessionDescription, StreamKind, TransceiverDirection, VideoCodec,
+    VideoFrame,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -933,6 +935,32 @@ fn discovery_name(name: &str) -> Option<String> {
     }
 }
 
+fn discovery_broadcast_addresses() -> Result<Vec<Ipv4Addr>, String> {
+    let interfaces = get_if_addrs().map_err(|error| format!("无法枚举局域网接口：{error}"))?;
+    let mut broadcasts = HashSet::new();
+    for interface in interfaces {
+        let IfAddr::V4(address) = interface.addr else {
+            continue;
+        };
+        if !(address.ip.is_private() || address.ip.is_link_local()) || address.ip.is_loopback() {
+            continue;
+        }
+        if let Some(broadcast) = subnet_broadcast(address.ip, address.netmask) {
+            broadcasts.insert(broadcast);
+        }
+    }
+    if broadcasts.is_empty() {
+        broadcasts.insert(Ipv4Addr::BROADCAST);
+    }
+    Ok(broadcasts.into_iter().collect())
+}
+
+fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
+    let mask = u32::from(netmask);
+    let broadcast = Ipv4Addr::from((u32::from(ip) & mask) | !mask);
+    (broadcast != ip && !broadcast.is_broadcast()).then_some(broadcast)
+}
+
 async fn run_discovery_responder(app: AppHandle, port: u16) -> Result<(), String> {
     let socket = tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
         .await
@@ -980,12 +1008,21 @@ fn discover_lan_devices_blocking() -> Result<Vec<DiscoveredDevice>, String> {
     std_socket
         .set_read_timeout(Some(Duration::from_millis(1200)))
         .map_err(|error| format!("无法配置局域网扫描超时：{error}"))?;
-    std_socket
-        .send_to(
+    let broadcasts = discovery_broadcast_addresses()?;
+    let mut sent = 0;
+    let mut send_errors = Vec::new();
+    for address in broadcasts {
+        match std_socket.send_to(
             br#"{"kind":"lantern_probe"}"#,
-            SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
-        )
-        .map_err(|error| format!("局域网扫描发送失败：{error}"))?;
+            SocketAddr::new(IpAddr::V4(address), DISCOVERY_PORT),
+        ) {
+            Ok(_) => sent += 1,
+            Err(error) => send_errors.push(format!("{address}: {error}")),
+        }
+    }
+    if sent == 0 {
+        return Err(format!("局域网扫描发送失败：{}", send_errors.join("；")));
+    }
 
     let mut devices = HashMap::new();
     let mut buffer = [0_u8; 512];
@@ -1933,9 +1970,6 @@ async fn run_webrtc_session(
             .create_video_track("lantern-screen")
             .map_err(|error| format!("无法创建屏幕视频轨道：{error}"))?,
     );
-    peer_connection
-        .add_track(&video_track)
-        .map_err(|error| format!("无法添加屏幕视频轨道：{error}"))?;
     let system_audio_enabled = system_audio_requested
         && state
             .remote
@@ -1953,13 +1987,7 @@ async fn run_webrtc_session(
             .webrtc_factory
             .create_audio_track_with_options("lantern-system-audio", options)
         {
-            Ok(track) => match peer_connection.add_track(&track) {
-                Ok(()) => Some(Arc::new(track)),
-                Err(error) => {
-                    audio_setup_error = Some(format!("无法添加系统声音轨道：{error}"));
-                    None
-                }
-            },
+            Ok(track) => Some(Arc::new(track)),
             Err(error) => {
                 audio_setup_error = Some(format!("无法创建系统声音轨道：{error}"));
                 None
@@ -1969,10 +1997,29 @@ async fn run_webrtc_session(
         None
     };
     for transceiver in peer_connection.transceivers() {
-        if transceiver.kind() == MediaKind::Video {
-            transceiver
-                .set_codec_preferences(&[VideoCodec::H264, VideoCodec::Vp8])
-                .map_err(|error| format!("无法配置 WebRTC 视频编码格式：{error}"))?;
+        match transceiver.kind() {
+            MediaKind::Video => {
+                transceiver
+                    .set_track(&video_track)
+                    .map_err(|error| format!("无法绑定屏幕视频轨道：{error}"))?;
+                transceiver
+                    .set_direction(TransceiverDirection::SendOnly)
+                    .map_err(|error| format!("无法启用屏幕视频发送：{error}"))?;
+                transceiver
+                    .set_codec_preferences(&[VideoCodec::H264, VideoCodec::Vp8])
+                    .map_err(|error| format!("无法配置 WebRTC 视频编码格式：{error}"))?;
+            }
+            MediaKind::Audio => {
+                if let Some(track) = &audio_track {
+                    transceiver
+                        .set_track(track)
+                        .map_err(|error| format!("无法绑定系统声音轨道：{error}"))?;
+                    transceiver
+                        .set_direction(TransceiverDirection::SendOnly)
+                        .map_err(|error| format!("无法启用系统声音发送：{error}"))?;
+                }
+            }
+            MediaKind::Unknown => {}
         }
     }
     let answer = peer_connection
@@ -2189,6 +2236,7 @@ async fn run_webrtc_session(
                                 file_receive_deadline = None;
                                 let transfer_id = incoming.receiver.metadata.transfer_id.clone();
                                 let file_name = incoming.receiver.metadata.file_name.clone();
+                                let received_size = incoming.receiver.metadata.expected_size;
                                 let saved_path = match finish_partial_file_receive(
                                     &state.app,
                                     incoming.receiver,
@@ -2217,7 +2265,7 @@ async fn run_webrtc_session(
                                     socket,
                                     serde_json::json!({
                                         "type": "file_transfer_complete",
-                                        "transfer_id": transfer_id,
+                                        "transfer_id": transfer_id.clone(),
                                     }),
                                 )
                                 .await
@@ -2227,9 +2275,11 @@ async fn run_webrtc_session(
                                     .emit(
                                         "remote-file-received",
                                         serde_json::json!({
+                                            "transferId": transfer_id,
                                             "fileName": file_name,
                                             "savedPath": saved_path,
                                             "controllerName": controller_name,
+                                            "receivedBytes": received_size,
                                         }),
                                     )
                                     .map_err(|error| {
@@ -2734,7 +2784,22 @@ async fn run_webrtc_session(
                             .as_ref()
                             .is_some_and(|incoming| incoming.receiver.metadata.transfer_id == transfer_id);
                         if !is_outgoing && !is_incoming {
-                            return Err("文件传输请求已过期。".to_string());
+                            let message = "文件传输已完成或请求已过期。".to_string();
+                            let _ = state.app.emit(
+                                "agent-file-transfer-error",
+                                serde_json::json!({
+                                    "transferId": transfer_id.clone(),
+                                    "message": message.clone(),
+                                }),
+                            );
+                            send_signal(socket, serde_json::json!({
+                                "type": "file_transfer_error",
+                                "transfer_id": transfer_id.clone(),
+                                "message": message,
+                            }))
+                            .await
+                            .map_err(|error| format!("发送文件传输错误状态失败：{error}"))?;
+                            continue;
                         }
                         send_signal(socket, serde_json::json!({
                             "type": "file_transfer_control",
@@ -3511,6 +3576,81 @@ mod tests {
         assert_eq!(
             system_audio_to_pcm(&[-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]),
             vec![-32767, -32767, -16384, 0, 16384, 32767, 32767]
+        );
+    }
+
+    #[test]
+    fn discovery_uses_each_lan_subnet_broadcast_address() {
+        assert_eq!(
+            subnet_broadcast(
+                Ipv4Addr::new(192, 168, 1, 23),
+                Ipv4Addr::new(255, 255, 255, 0)
+            ),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        assert_eq!(
+            subnet_broadcast(
+                Ipv4Addr::new(192, 168, 1, 23),
+                Ipv4Addr::new(255, 255, 255, 255)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn answering_recvonly_transceivers_publishes_system_audio_track() {
+        let factory = PeerConnectionFactory::builder().build().unwrap();
+        let offerer = factory
+            .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
+            .unwrap();
+        offerer
+            .add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly)
+            .unwrap();
+        offerer
+            .add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly)
+            .unwrap();
+        let offer = offerer.create_offer().unwrap();
+        offerer.set_local_description(&offer).unwrap();
+
+        let answerer = factory
+            .create_peer_connection(&RtcConfiguration::default(), PeerConnectionObserver::new())
+            .unwrap();
+        answerer.set_remote_description(&offer).unwrap();
+        let video = factory.create_video_track("test-screen").unwrap();
+        let mut options = AudioTrackOptions::default();
+        options.source = AudioTrackSource::LocalPush;
+        let audio = factory
+            .create_audio_track_with_options("test-system-audio", options)
+            .unwrap();
+        for transceiver in answerer.transceivers() {
+            match transceiver.kind() {
+                MediaKind::Video => {
+                    transceiver.set_track(&video).unwrap();
+                    transceiver
+                        .set_direction(TransceiverDirection::SendOnly)
+                        .unwrap();
+                }
+                MediaKind::Audio => {
+                    transceiver.set_track(&audio).unwrap();
+                    transceiver
+                        .set_direction(TransceiverDirection::SendOnly)
+                        .unwrap();
+                }
+                MediaKind::Unknown => {}
+            }
+        }
+        let answer = answerer.create_answer().unwrap();
+        let mut in_audio_section = false;
+        let audio_is_sendonly = answer.sdp.lines().any(|line| {
+            if line.starts_with("m=") {
+                in_audio_section = line.starts_with("m=audio ");
+            }
+            in_audio_section && line.trim() == "a=sendonly"
+        });
+        assert!(
+            audio_is_sendonly,
+            "answer did not publish audio:\n{}",
+            answer.sdp
         );
     }
 

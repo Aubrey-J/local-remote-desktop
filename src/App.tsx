@@ -830,8 +830,16 @@ function App() {
         setPendingFileOffer({ ...event.payload, direction: "to-agent" });
         void focusMainWindow();
       }),
-      listen<{ fileName: string; savedPath: string }>("remote-file-received", (event) => {
+      listen<{
+        transferId: string;
+        fileName: string;
+        savedPath: string;
+        receivedBytes: number;
+      }>("remote-file-received", (event) => {
         if (!isMainWindow) return;
+        if (activeFileTransferRef.current?.transferId === event.payload.transferId) {
+          updateActiveFileTransfer(null);
+        }
         setTransferStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
       }),
     ]).then(([requestListener, requestEndedListener, statusListener, agentConnectionListener, peerIdentityListener, clipboardListener, fileListener, receivedListener]) => {
