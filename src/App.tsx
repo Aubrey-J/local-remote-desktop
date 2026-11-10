@@ -323,6 +323,7 @@ function App() {
     }
   });
   const [audioStatus, setAudioStatus] = useState("");
+  const [audioTransportStatus, setAudioTransportStatus] = useState("");
   const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
   const [trustedDevices, setTrustedDevices] = useState<TrustedDevice[]>([]);
   const [trustedDevicesError, setTrustedDevicesError] = useState("");
@@ -644,6 +645,54 @@ function App() {
       window.clearInterval(timer);
     };
   }, [connectionStatus]);
+
+  useEffect(() => {
+    if (connectionStatus !== "connected" || !playRemoteSystemAudio) {
+      setAudioTransportStatus("");
+      return;
+    }
+    let cancelled = false;
+    const sampleAudio = async () => {
+      const peer = peerConnectionRef.current;
+      if (!peer || peer.connectionState !== "connected") return;
+      try {
+        const stats = await peer.getStats();
+        if (cancelled || peerConnectionRef.current !== peer) return;
+        let receivedAudio = false;
+        let packetsReceived = 0;
+        let bytesReceived = 0;
+        let audioLevel = 0;
+        stats.forEach((stat) => {
+          if (stat.type !== "inbound-rtp") return;
+          const inbound = stat as RTCInboundRtpStreamStats & {
+            kind?: string;
+            mediaType?: string;
+            audioLevel?: number;
+          };
+          if ((inbound.kind ?? inbound.mediaType) !== "audio") return;
+          receivedAudio = true;
+          packetsReceived += inbound.packetsReceived ?? 0;
+          bytesReceived += inbound.bytesReceived ?? 0;
+          audioLevel = Math.max(audioLevel, inbound.audioLevel ?? 0);
+        });
+        setAudioTransportStatus(
+          receivedAudio
+            ? `控制端音频 RTP：${packetsReceived} 包 / ${bytesReceived.toLocaleString()} 字节，音量值 ${audioLevel.toFixed(3)}`
+            : "控制端尚未收到远端音频 RTP 数据。",
+        );
+      } catch (cause) {
+        if (cancelled) return;
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setAudioTransportStatus(`无法读取接收音频统计：${detail}`);
+      }
+    };
+    void sampleAudio();
+    const timer = window.setInterval(() => void sampleAudio(), 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [connectionStatus, playRemoteSystemAudio]);
 
   useEffect(() => {
     if (!standaloneDeviceId && deviceLayout === "list" && connectionDeviceId) disconnectFromDevice();
@@ -1554,6 +1603,7 @@ function App() {
     setConnectionError("");
     setEncoderStatus("");
     setAudioStatus(playRemoteSystemAudio ? "正在等待远端系统声音…" : "");
+    setAudioTransportStatus("");
     setAudioPlaybackBlocked(false);
 
     try {
@@ -2089,6 +2139,7 @@ function App() {
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
     setAudioPlaybackBlocked(false);
     setAudioStatus("");
+    setAudioTransportStatus("");
     setConnectionDeviceId(null);
     setConnectionStatus("idle");
     setConnectionError("");
@@ -3062,9 +3113,12 @@ function App() {
                           }}
                         >
                           <span>{audioStatus}</span>
-                          {audioPlaybackBlocked && (
-                            <button onClick={playRemoteAudio} type="button">播放声音</button>
-                          )}
+                            {audioTransportStatus && <span>{audioTransportStatus}</span>}
+                            {remoteAudioStreamRef.current && (
+                              <button onClick={playRemoteAudio} type="button">
+                                {audioPlaybackBlocked ? "点击播放" : "重新启动声音"}
+                              </button>
+                            )}
                         </div>
                       )}
                       <span className="remote-live">
@@ -3540,6 +3594,7 @@ function App() {
                     </span>
                   </label>
                   {audioStatus && <p className="settings-note" role="status">{audioStatus}</p>}
+                  {audioTransportStatus && <p className="settings-note" role="status">{audioTransportStatus}</p>}
                   {!isTauri() && <p className="settings-note">系统声音传输仅在 Lantern 桌面应用中可用。</p>}
                   {playRemoteAudioSettingLocked && (
                     <p className="settings-note">控制端连接期间无法修改播放选项，请先断开连接。</p>

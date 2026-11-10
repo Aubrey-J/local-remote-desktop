@@ -1678,22 +1678,37 @@ impl StatsWorker {
         }
         let stopping = Arc::clone(&self.stopping);
         self.thread = Some(thread::spawn(move || {
+            let mut audio_report_tick = 0_u8;
             while !stopping.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_secs(1));
                 if stopping.load(Ordering::Acquire) {
                     break;
                 }
-                if let Ok(stats) = peer_connection.get_stats()
-                    && let Some(video) = stats
+                audio_report_tick = (audio_report_tick + 1) % 3;
+                if let Ok(stats) = peer_connection.get_stats() {
+                    if let Some(video) = stats
                         .outbound_rtp
                         .iter()
                         .find(|stream| stream.kind == StreamKind::Video)
-                {
-                    let _ = signals.send(WebRtcSignal::EncoderStatus {
-                        codec: video.codec_mime_type.clone(),
-                        encoder: video.encoder_implementation.clone(),
-                        hardware: video.power_efficient_encoder,
-                    });
+                    {
+                        let _ = signals.send(WebRtcSignal::EncoderStatus {
+                            codec: video.codec_mime_type.clone(),
+                            encoder: video.encoder_implementation.clone(),
+                            hardware: video.power_efficient_encoder,
+                        });
+                    }
+                    if let Some(audio) = stats
+                        .outbound_rtp
+                        .iter()
+                        .find(|stream| stream.kind == StreamKind::Audio)
+                        && audio_report_tick == 0
+                    {
+                        let codec = audio.codec_mime_type.as_deref().unwrap_or("codec pending");
+                        let _ = signals.send(WebRtcSignal::AudioStatus(format!(
+                            "音频发送链路：{} 包，{} 字节（{}）。",
+                            audio.packets_sent, audio.bytes_sent, codec
+                        )));
+                    }
                 }
             }
         }));
