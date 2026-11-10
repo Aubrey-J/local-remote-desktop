@@ -53,6 +53,7 @@ jobs:
             libfuse2 \
             wget \
             libayatana-appindicator3-dev \
+            libasound2-dev \
             libgtk-3-dev \
             libssl-dev \
             libwebkit2gtk-4.1-dev \
