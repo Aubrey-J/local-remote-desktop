@@ -263,6 +263,7 @@ function App() {
   const [discoveredDevices, setDiscoveredDevices] = useState<DiscoveredDevice[]>([]);
   const [discoveryStatus, setDiscoveryStatus] = useState("");
   const [isDiscovering, setIsDiscovering] = useState(false);
+  const [isSavingDevice, setIsSavingDevice] = useState(false);
   const [openDeviceMenuId, setOpenDeviceMenuId] = useState<string | null>(null);
   const [pendingRemoval, setPendingRemoval] = useState<Device | null>(null);
   const [videoQuality, setVideoQuality] = useState<VideoQuality>(() => {
@@ -1158,7 +1159,7 @@ function App() {
     );
   const shareSystemAudioSettingLocked = agentConnected || pendingRequest !== null;
 
-  function saveDevice(event: React.FormEvent<HTMLFormElement>) {
+  async function saveDevice(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmedName = name.trim();
     const trimmedAddress = address.trim();
@@ -1172,6 +1173,26 @@ function App() {
       return;
     }
     const normalizedAddress = normalizeAddress(trimmedAddress);
+    if (isTauri()) {
+      setIsSavingDevice(true);
+      try {
+        if (await invoke<boolean>("is_local_device_address", { address: normalizedAddress })) {
+          setError("不能将本机自己添加为远程设备。");
+          return;
+        }
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        setError(`无法验证设备地址是否属于本机：${detail}`);
+        return;
+      } finally {
+        setIsSavingDevice(false);
+      }
+    } else if (["localhost", "127.0.0.1", "::1"].includes(
+      new URL(`http://${normalizedAddress}`).hostname.replace(/^\[|\]$/g, ""),
+    )) {
+      setError("不能将本机自己添加为远程设备。");
+      return;
+    }
     if (devices.some(
       (device) =>
         device.id !== editingDevice?.id &&
@@ -1226,7 +1247,7 @@ function App() {
     try {
       const discovered = await invoke<DiscoveredDevice[]>("discover_lan_devices");
       setDiscoveredDevices(discovered);
-      setDiscoveryStatus(discovered.length ? `找到 ${discovered.length} 台正在运行被控端的设备。` : "未发现设备；请确认对端已启动被控端并处于同一局域网。");
+      setDiscoveryStatus(discovered.length ? `找到 ${discovered.length} 台正在运行被控端的设备。` : "未发现其他设备；请确认对端已启动被控端并处于同一局域网。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setDiscoveryStatus(`扫描失败：${detail}`);
@@ -1905,8 +1926,18 @@ function App() {
     peer.ontrack = (event) => {
       if (peerConnectionRef.current !== peer) return;
       if (event.track.kind === "audio") {
-        remoteAudioStreamRef.current = new MediaStream([event.track]);
-        setAudioStatus("已连接远端系统声音。");
+        remoteAudioStreamRef.current = event.streams[0] ?? new MediaStream([event.track]);
+        event.track.onunmute = () => {
+          if (peerConnectionRef.current !== peer) return;
+          setAudioStatus("已收到远端音频数据，正在启动播放。");
+          startRemoteAudioPlayback(peer);
+        };
+        event.track.onmute = () => {
+          if (peerConnectionRef.current === peer) {
+            setAudioStatus("远端音频轨道暂时没有数据。");
+          }
+        };
+        setAudioStatus("已连接远端音频轨道，等待声音数据。");
         startRemoteAudioPlayback(peer);
         return;
       }
@@ -1979,6 +2010,8 @@ function App() {
     const stream = remoteAudioStreamRef.current;
     if (!audio || !stream || peerConnectionRef.current !== peer) return;
     audio.srcObject = stream;
+    audio.muted = false;
+    audio.volume = 1;
     void audio.play()
       .then(() => {
         if (peerConnectionRef.current !== peer) return;
@@ -3009,7 +3042,17 @@ function App() {
                           height: event.currentTarget.videoHeight,
                         })}
                       />
-                      <audio autoPlay className="remote-audio" playsInline ref={remoteAudioRef} />
+                      <audio
+                        autoPlay
+                        className="remote-audio"
+                        playsInline
+                        ref={remoteAudioRef}
+                        onPlaying={() => setAudioStatus("远端音频播放已启动。")}
+                        onError={(event) => {
+                          const code = event.currentTarget.error?.code;
+                          setAudioStatus(`浏览器音频输出失败${code ? `（错误码 ${code}）` : ""}。`);
+                        }}
+                      />
                       {playRemoteSystemAudio && audioStatus && (
                         <div
                           className="remote-audio-status"
@@ -3317,8 +3360,8 @@ function App() {
               >
                 取消
               </button>
-              <button className="primary-button" type="submit">
-                {editingDevice ? "保存修改" : "保存设备"}
+              <button className="primary-button" disabled={isSavingDevice} type="submit">
+                {isSavingDevice ? "正在校验…" : editingDevice ? "保存修改" : "保存设备"}
               </button>
             </div>
           </form>

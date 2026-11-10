@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -955,6 +955,32 @@ fn discovery_broadcast_addresses() -> Result<Vec<Ipv4Addr>, String> {
     Ok(broadcasts.into_iter().collect())
 }
 
+fn local_device_ips() -> Result<HashSet<IpAddr>, String> {
+    let mut addresses = get_if_addrs()
+        .map_err(|error| format!("无法枚举本机网络接口：{error}"))?
+        .into_iter()
+        .map(|interface| match interface.addr {
+            IfAddr::V4(address) => IpAddr::V4(address.ip),
+            IfAddr::V6(address) => IpAddr::V6(address.ip),
+        })
+        .collect::<HashSet<_>>();
+    addresses.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    addresses.insert(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    Ok(addresses)
+}
+
+fn is_local_device_ip(address: IpAddr, local_addresses: &HashSet<IpAddr>) -> bool {
+    match address {
+        IpAddr::V4(ip) => local_addresses.contains(&IpAddr::V4(ip)),
+        IpAddr::V6(ip) => {
+            local_addresses.contains(&IpAddr::V6(ip))
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| local_addresses.contains(&IpAddr::V4(mapped)))
+        }
+    }
+}
+
 fn subnet_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<Ipv4Addr> {
     let mask = u32::from(netmask);
     let broadcast = Ipv4Addr::from((u32::from(ip) & mask) | !mask);
@@ -1000,6 +1026,7 @@ pub async fn discover_lan_devices() -> Result<Vec<DiscoveredDevice>, String> {
 }
 
 fn discover_lan_devices_blocking() -> Result<Vec<DiscoveredDevice>, String> {
+    let local_addresses = local_device_ips()?;
     let std_socket = std::net::UdpSocket::bind(("0.0.0.0", 0))
         .map_err(|error| format!("无法启动局域网扫描：{error}"))?;
     std_socket
@@ -1029,7 +1056,7 @@ fn discover_lan_devices_blocking() -> Result<Vec<DiscoveredDevice>, String> {
     loop {
         match std_socket.recv_from(&mut buffer) {
             Ok((length, peer)) => {
-                if !is_lan_address(peer.ip()) {
+                if !is_lan_address(peer.ip()) || is_local_device_ip(peer.ip(), &local_addresses) {
                     continue;
                 }
                 let Ok(packet) = serde_json::from_slice::<DiscoveryPacket>(&buffer[..length])
@@ -1196,6 +1223,17 @@ pub fn get_local_device_info() -> Result<LocalDeviceInfo, String> {
         .map(|ip| format!("{ip}:{DEFAULT_PORT}"))
         .ok_or_else(|| "无法确定本机局域网 IP，请检查网络连接。".to_string())?;
     Ok(LocalDeviceInfo { name, address })
+}
+
+#[tauri::command]
+pub fn is_local_device_address(address: String) -> Result<bool, String> {
+    let local_addresses = local_device_ips()?;
+    let resolved_addresses = address
+        .to_socket_addrs()
+        .map_err(|error| format!("无法校验设备地址：{error}"))?;
+    Ok(resolved_addresses
+        .map(|socket_address| socket_address.ip())
+        .any(|ip| is_local_device_ip(ip, &local_addresses)))
 }
 
 #[tauri::command]
@@ -1776,12 +1814,24 @@ impl AudioCaptureWorker {
                 return;
             }
 
-            let status = "正在捕获并共享被控端系统声音。".to_string();
+            let status = "系统声音采集已启动，正在等待声音。".to_string();
             let _ = append_diagnostic_log(&app, DiagnosticEvent::AudioCaptureStarted);
             let _ = app.emit("agent-audio-status", &status);
             let _ = signals.send(WebRtcSignal::AudioStatus(status));
+            let mut audio_detected = false;
             while !stopping.load(Ordering::Acquire) {
                 if let Some(chunk) = stream.poll_chunk() {
+                    let has_audio = chunk.peak >= 0.001;
+                    if has_audio != audio_detected {
+                        audio_detected = has_audio;
+                        let status = if audio_detected {
+                            "被控端已检测到系统声音，正在发送。".to_string()
+                        } else {
+                            "系统声音采集已运行，但当前未检测到声音。".to_string()
+                        };
+                        let _ = app.emit("agent-audio-status", &status);
+                        let _ = signals.send(WebRtcSignal::AudioStatus(status));
+                    }
                     let pcm = system_audio_to_pcm(&chunk.data);
                     if let Err(error) = track.push_frame(AudioFrame::new(&pcm, 48_000, 2)) {
                         let status = format!("系统声音传输停止：{error}");
@@ -3595,6 +3645,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn local_device_detection_matches_interface_and_loopback_addresses() {
+        let local_addresses = HashSet::from([
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ]);
+        assert!(is_local_device_ip(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23)),
+            &local_addresses
+        ));
+        assert!(is_local_device_ip(
+            IpAddr::V6("::ffff:192.168.1.23".parse().unwrap()),
+            &local_addresses
+        ));
+        assert!(!is_local_device_ip(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 24)),
+            &local_addresses
+        ));
     }
 
     #[test]

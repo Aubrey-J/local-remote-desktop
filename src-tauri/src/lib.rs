@@ -119,6 +119,7 @@ pub fn run() {
             remote::get_pending_connection_request,
             remote::answer_connection_request,
             remote::get_local_device_info,
+            remote::is_local_device_address,
             remote::get_trusted_devices,
             remote::remove_trusted_device,
             remote::answer_file_transfer,
