@@ -69,6 +69,9 @@ type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "e
 type StandaloneWindowStatus = RemoteStatus | "opening";
 type SettingsSection = "video" | "audio" | "clipboard" | "window" | "trusted" | "diagnostics";
 type DiagnosticEvent =
+  | "discovery_started"
+  | "discovery_completed"
+  | "discovery_failed"
   | "connection_started"
   | "connection_approved"
   | "connection_established"
@@ -85,10 +88,26 @@ type DiagnosticEvent =
   | "agent_connection_interrupted"
   | "agent_connection_closed"
   | "file_transfer_started"
+  | "file_transfer_offer_received"
+  | "file_transfer_accepted"
+  | "file_transfer_rejected"
+  | "file_transfer_paused"
+  | "file_transfer_resumed"
+  | "file_transfer_cancelled"
+  | "file_transfer_progress"
   | "file_transfer_interrupted"
   | "file_transfer_completed"
   | "file_transfer_failed"
   | "clipboard_sync_failed"
+  | "clipboard_text_sent"
+  | "clipboard_text_received"
+  | "audio_inbound_rtp_stats"
+  | "audio_inbound_stats_read_failed"
+  | "audio_remote_track_received"
+  | "audio_remote_track_unmuted"
+  | "audio_playback_started"
+  | "audio_playback_blocked"
+  | "audio_playback_failed"
   | "quality_reduced"
   | "quality_restored";
 
@@ -547,6 +566,7 @@ function App() {
           return;
         }
         socket.send(JSON.stringify({ type: "clipboard_text", text }));
+        recordDiagnosticEvent("clipboard_text_sent", new TextEncoder().encode(text).byteLength);
         lastClipboardTextRef.current = text;
       } catch (cause) {
         if (cancelled || clipboardReadErrorReportedRef.current) return;
@@ -579,6 +599,7 @@ function App() {
       try {
         const stats = await peer.getStats();
         if (cancelled || peerConnectionRef.current !== peer) return;
+        statsReadErrorReported = false;
         statsReadErrorReported = false;
         let received = 0;
         let lost = 0;
@@ -652,6 +673,8 @@ function App() {
       return;
     }
     let cancelled = false;
+    let lastStatsLogAt = 0;
+    let statsReadErrorReported = false;
     const sampleAudio = async () => {
       const peer = peerConnectionRef.current;
       if (!peer || peer.connectionState !== "connected") return;
@@ -680,10 +703,18 @@ function App() {
             ? `控制端音频 RTP：${packetsReceived} 包 / ${bytesReceived.toLocaleString()} 字节，音量值 ${audioLevel.toFixed(3)}`
             : "控制端尚未收到远端音频 RTP 数据。",
         );
+        if (Date.now() - lastStatsLogAt >= 15_000) {
+          recordDiagnosticEvent("audio_inbound_rtp_stats", packetsReceived, bytesReceived);
+          lastStatsLogAt = Date.now();
+        }
       } catch (cause) {
         if (cancelled) return;
         const detail = cause instanceof Error ? cause.message : String(cause);
         setAudioTransportStatus(`无法读取接收音频统计：${detail}`);
+        if (!statsReadErrorReported) {
+          statsReadErrorReported = true;
+          recordDiagnosticEvent("audio_inbound_stats_read_failed");
+        }
       }
     };
     void sampleAudio();
@@ -861,6 +892,10 @@ function App() {
       }),
       listen<ClipboardOffer>("remote-clipboard-offer", (event) => {
         if (!isMainWindow) return;
+        recordDiagnosticEvent(
+          "clipboard_text_received",
+          new TextEncoder().encode(event.payload.text).byteLength,
+        );
         if (clipboardSessionAllowedRef.current) {
           void invoke("set_system_clipboard_text", { text: event.payload.text })
             .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
@@ -877,6 +912,7 @@ function App() {
       }),
       listen<Omit<FileOffer, "direction">>("remote-file-offer", (event) => {
         if (!isMainWindow) return;
+        recordDiagnosticEvent("file_transfer_offer_received", event.payload.size);
         setPendingFileOffer({ ...event.payload, direction: "to-agent" });
         void focusMainWindow();
       }),
@@ -1293,12 +1329,15 @@ function App() {
     }
     setIsDiscovering(true);
     setDiscoveryStatus("");
+    recordDiagnosticEvent("discovery_started");
     try {
       const discovered = await invoke<DiscoveredDevice[]>("discover_lan_devices");
       setDiscoveredDevices(discovered);
+      recordDiagnosticEvent("discovery_completed", discovered.length);
       setDiscoveryStatus(discovered.length ? `找到 ${discovered.length} 台正在运行被控端的设备。` : "未发现其他设备；请确认对端已启动被控端并处于同一局域网。");
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
+      recordDiagnosticEvent("discovery_failed");
       setDiscoveryStatus(`扫描失败：${detail}`);
     } finally {
       setIsDiscovering(false);
@@ -1422,9 +1461,16 @@ function App() {
     }
   }
 
-  function recordDiagnosticEvent(event: DiagnosticEvent) {
+  function recordDiagnosticEvent(
+    event: DiagnosticEvent,
+    value?: number,
+    value2?: number,
+  ) {
     if (!isTauri()) return;
-    void invoke("log_diagnostic_event", { event }).catch((cause: unknown) => {
+    const args: { event: DiagnosticEvent; value?: number; value2?: number } = { event };
+    if (value !== undefined) args.value = value;
+    if (value2 !== undefined) args.value2 = value2;
+    void invoke("log_diagnostic_event", args).catch((cause: unknown) => {
       const detail = cause instanceof Error ? cause.message : String(cause);
       setDiagnosticLogError(`无法写入本机诊断日志：${detail}`);
     });
@@ -1782,6 +1828,7 @@ function App() {
           if (session) {
             clearFileTransferIdentity(message.transfer_id);
             pendingFileSendsRef.current.delete(message.transfer_id);
+            recordDiagnosticEvent("file_transfer_completed", session.file.size);
           }
           setTransferStatus("文件已成功发送。");
           updateActiveFileTransfer(null);
@@ -1792,6 +1839,12 @@ function App() {
         ) {
           const active = activeFileTransferRef.current;
           if (active?.transferId === message.transfer_id) {
+            const controlEvent = message.action === "pause"
+              ? "file_transfer_paused"
+              : message.action === "resume"
+                ? "file_transfer_resumed"
+                : "file_transfer_cancelled";
+            recordDiagnosticEvent(controlEvent, active.transferred, active.size);
             if (message.action === "cancel") {
               if (active.mode === "send") {
                 const session = pendingFileSendsRef.current.get(message.transfer_id);
@@ -1976,9 +2029,11 @@ function App() {
     peer.ontrack = (event) => {
       if (peerConnectionRef.current !== peer) return;
       if (event.track.kind === "audio") {
+        recordDiagnosticEvent("audio_remote_track_received");
         remoteAudioStreamRef.current = event.streams[0] ?? new MediaStream([event.track]);
         event.track.onunmute = () => {
           if (peerConnectionRef.current !== peer) return;
+          recordDiagnosticEvent("audio_remote_track_unmuted");
           setAudioStatus("已收到远端音频数据，正在启动播放。");
           startRemoteAudioPlayback(peer);
         };
@@ -2065,11 +2120,13 @@ function App() {
     void audio.play()
       .then(() => {
         if (peerConnectionRef.current !== peer) return;
+        recordDiagnosticEvent("audio_playback_started");
         setAudioPlaybackBlocked(false);
         setAudioStatus("正在播放远端系统声音。");
       })
       .catch(() => {
         if (peerConnectionRef.current !== peer) return;
+        recordDiagnosticEvent("audio_playback_blocked");
         setAudioPlaybackBlocked(true);
         setAudioStatus("远端系统声音已就绪，需要手动开始播放。");
       });
@@ -2080,11 +2137,13 @@ function App() {
     if (!audio) return;
     void audio.play()
       .then(() => {
+        recordDiagnosticEvent("audio_playback_started");
         setAudioPlaybackBlocked(false);
         setAudioStatus("正在播放远端系统声音。");
       })
       .catch((cause: unknown) => {
         const detail = cause instanceof Error ? cause.message : String(cause);
+        recordDiagnosticEvent("audio_playback_failed");
         setAudioStatus(`无法播放远端系统声音：${detail}`);
       });
   }
@@ -2280,6 +2339,10 @@ function App() {
     setPendingFileOffer(null);
     if (!offer) return;
     try {
+      recordDiagnosticEvent(
+        accepted ? "file_transfer_accepted" : "file_transfer_rejected",
+        offer.size,
+      );
       if (offer.direction === "from-agent") {
         const socket = connectionRef.current;
         if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("控制连接已关闭。");
@@ -2393,7 +2456,7 @@ function App() {
         size: file.size,
         sha256,
       }));
-      recordDiagnosticEvent("file_transfer_started");
+      recordDiagnosticEvent("file_transfer_started", file.size);
       setTransferStatus(`已请求发送 ${file.name}，等待对端批准。`);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
@@ -2403,6 +2466,7 @@ function App() {
 
   async function transmitFile(socket: WebSocket, transferId: string, file: File, resumeOffset: number) {
     let offset = resumeOffset;
+    let loggedProgressBucket = Math.floor(resumeOffset / (5 * 1024 * 1024));
     try {
       const chunkSize = 48 * 1024;
       while (offset < file.size) {
@@ -2428,6 +2492,11 @@ function App() {
         if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
         socket.send(chunk);
         offset += chunk.byteLength;
+        const progressBucket = Math.floor(offset / (5 * 1024 * 1024));
+        if (progressBucket > loggedProgressBucket) {
+          loggedProgressBucket = progressBucket;
+          recordDiagnosticEvent("file_transfer_progress", offset, file.size);
+        }
         const active = activeFileTransferRef.current;
         if (active?.transferId === transferId) {
           updateActiveFileTransfer({ ...active, transferred: offset });
@@ -2467,7 +2536,7 @@ function App() {
       const transferId = await getOrCreateFileTransferId(file.name, sha256, targetIdentity);
       if (!agentConnected) throw new Error("校验完成时被控端连接已断开。");
       pendingAgentFileRef.current = { transferId, file, sha256, paused: false, cancelled: false };
-      recordDiagnosticEvent("file_transfer_started");
+      recordDiagnosticEvent("file_transfer_started", file.size);
       updateActiveFileTransfer({
         transferId,
         fileName: file.name,
@@ -2494,6 +2563,7 @@ function App() {
 
   async function transmitAgentFile(transferId: string, file: File, resumeOffset: number) {
     let offset = resumeOffset;
+    let loggedProgressBucket = Math.floor(resumeOffset / (5 * 1024 * 1024));
     let awaitingCompletion = false;
     try {
       const chunkSize = 48 * 1024;
@@ -2514,6 +2584,11 @@ function App() {
           bytes: Array.from(chunk),
         });
         offset += chunk.byteLength;
+        const progressBucket = Math.floor(offset / (5 * 1024 * 1024));
+        if (progressBucket > loggedProgressBucket) {
+          loggedProgressBucket = progressBucket;
+          recordDiagnosticEvent("file_transfer_progress", offset, file.size);
+        }
         const active = activeFileTransferRef.current;
         if (active?.transferId === transferId) {
           updateActiveFileTransfer({ ...active, transferred: offset });
@@ -2557,7 +2632,7 @@ function App() {
       const savedPath = await invoke<string>("finish_controller_file_receive", { transferId });
       socket.send(JSON.stringify({ type: "file_transfer_complete", transfer_id: transferId }));
       updateActiveFileTransfer(null);
-      recordDiagnosticEvent("file_transfer_completed");
+      recordDiagnosticEvent("file_transfer_completed", incoming.size);
       setTransferStatus(`已接收 ${incoming.fileName}，保存至 ${savedPath}`);
     } catch (cause) {
       suspendControllerFileReceive(transferId);
@@ -2622,6 +2697,12 @@ function App() {
           action,
         });
       }
+      const event = action === "pause"
+        ? "file_transfer_paused"
+        : action === "resume"
+          ? "file_transfer_resumed"
+          : "file_transfer_cancelled";
+      recordDiagnosticEvent(event, active.transferred, active.size);
 
       if (action === "cancel") {
         if (active.mode === "send") {
@@ -3677,7 +3758,7 @@ function App() {
               {settingsSection === "diagnostics" && (
                 <div className="settings-page-content">
                   <h3>诊断日志</h3>
-                  <p>仅记录连接、被控服务和传输的状态事件，不记录设备地址、文件名、剪贴板内容或屏幕内容。日志保存在本机。</p>
+                  <p>记录连接、媒体协商、音视频帧与 RTP 统计、传输控制和发现状态；仅附带有限数值计数，不记录设备地址、文件名、按键值、剪贴板内容或屏幕内容。日志保存在本机。</p>
                   {diagnosticLogError && <p className="form-error" role="alert">{diagnosticLogError}</p>}
                   {!isTauri() ? (
                     <p className="settings-note">诊断日志仅在 Lantern 桌面应用中可用。</p>

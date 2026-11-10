@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -57,12 +57,22 @@ static DIAGNOSTIC_LOG_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticEvent {
+    DiscoveryStarted,
+    DiscoveryCompleted,
+    DiscoveryFailed,
     ConnectionStarted,
+    ConnectionRequestReceived,
+    ConnectionRequestApproved,
+    ConnectionRequestRejected,
     ConnectionApproved,
     ConnectionEstablished,
     ConnectionFailed,
     ConnectionInterrupted,
     ConnectionClosed,
+    SignalingOfferReceived,
+    WebRtcAnswerCreated,
+    IceCandidateSent,
+    IceCandidateReceived,
     AgentConnectionApproved,
     AgentConnectionEstablished,
     AgentConnectionFailed,
@@ -72,13 +82,47 @@ pub enum DiagnosticEvent {
     AgentStopped,
     AgentStartFailed,
     AgentStopFailed,
+    AudioNegotiationSendOnly,
+    AudioNegotiationMissing,
+    AudioNegotiationNotRequested,
+    AudioTrackCreated,
+    AudioOutboundRtpMissing,
+    AudioInboundStatsReadFailed,
     FileTransferStarted,
+    FileTransferOfferReceived,
+    FileTransferAccepted,
+    FileTransferRejected,
+    FileTransferPaused,
+    FileTransferResumed,
+    FileTransferCancelled,
+    FileTransferProgress,
     FileTransferInterrupted,
     FileTransferCompleted,
     FileTransferFailed,
     AudioCaptureStarted,
+    AudioCaptureSignalDetected,
+    AudioCaptureSignalMissing,
+    AudioFramesSubmitted,
+    AudioOutboundRtpStats,
+    AudioInboundRtpStats,
+    AudioRemoteTrackReceived,
+    AudioRemoteTrackUnmuted,
+    AudioPlaybackStarted,
+    AudioPlaybackBlocked,
+    AudioPlaybackFailed,
     AudioCaptureFailed,
+    VideoCaptureFailed,
+    ClipboardSyncStarted,
+    ClipboardTextSent,
+    ClipboardTextReceived,
     ClipboardSyncFailed,
+    VideoTrackCreated,
+    VideoFramesSubmitted,
+    WebRtcStateConnected,
+    WebRtcStateDisconnected,
+    WebRtcStateFailed,
+    WebRtcStatsReadFailed,
+    InputMessagesProcessed,
     QualityReduced,
     QualityRestored,
 }
@@ -93,12 +137,22 @@ fn system_audio_to_pcm(samples: &[f32]) -> Vec<i16> {
 impl DiagnosticEvent {
     fn as_str(self) -> &'static str {
         match self {
+            Self::DiscoveryStarted => "discovery_started",
+            Self::DiscoveryCompleted => "discovery_completed",
+            Self::DiscoveryFailed => "discovery_failed",
             Self::ConnectionStarted => "connection_started",
+            Self::ConnectionRequestReceived => "connection_request_received",
+            Self::ConnectionRequestApproved => "connection_request_approved",
+            Self::ConnectionRequestRejected => "connection_request_rejected",
             Self::ConnectionApproved => "connection_approved",
             Self::ConnectionEstablished => "connection_established",
             Self::ConnectionFailed => "connection_failed",
             Self::ConnectionInterrupted => "connection_interrupted",
             Self::ConnectionClosed => "connection_closed",
+            Self::SignalingOfferReceived => "signaling_offer_received",
+            Self::WebRtcAnswerCreated => "webrtc_answer_created",
+            Self::IceCandidateSent => "ice_candidate_sent",
+            Self::IceCandidateReceived => "ice_candidate_received",
             Self::AgentConnectionApproved => "agent_connection_approved",
             Self::AgentConnectionEstablished => "agent_connection_established",
             Self::AgentConnectionFailed => "agent_connection_failed",
@@ -108,13 +162,47 @@ impl DiagnosticEvent {
             Self::AgentStopped => "agent_stopped",
             Self::AgentStartFailed => "agent_start_failed",
             Self::AgentStopFailed => "agent_stop_failed",
+            Self::AudioNegotiationSendOnly => "audio_negotiation_sendonly",
+            Self::AudioNegotiationMissing => "audio_negotiation_missing",
+            Self::AudioNegotiationNotRequested => "audio_negotiation_not_requested",
+            Self::AudioTrackCreated => "audio_track_created",
+            Self::AudioOutboundRtpMissing => "audio_outbound_rtp_missing",
+            Self::AudioInboundStatsReadFailed => "audio_inbound_stats_read_failed",
             Self::FileTransferStarted => "file_transfer_started",
+            Self::FileTransferOfferReceived => "file_transfer_offer_received",
+            Self::FileTransferAccepted => "file_transfer_accepted",
+            Self::FileTransferRejected => "file_transfer_rejected",
+            Self::FileTransferPaused => "file_transfer_paused",
+            Self::FileTransferResumed => "file_transfer_resumed",
+            Self::FileTransferCancelled => "file_transfer_cancelled",
+            Self::FileTransferProgress => "file_transfer_progress",
             Self::FileTransferInterrupted => "file_transfer_interrupted",
             Self::FileTransferCompleted => "file_transfer_completed",
             Self::FileTransferFailed => "file_transfer_failed",
             Self::AudioCaptureStarted => "audio_capture_started",
+            Self::AudioCaptureSignalDetected => "audio_capture_signal_detected",
+            Self::AudioCaptureSignalMissing => "audio_capture_signal_missing",
+            Self::AudioFramesSubmitted => "audio_frames_submitted",
+            Self::AudioOutboundRtpStats => "audio_outbound_rtp_stats",
+            Self::AudioInboundRtpStats => "audio_inbound_rtp_stats",
+            Self::AudioRemoteTrackReceived => "audio_remote_track_received",
+            Self::AudioRemoteTrackUnmuted => "audio_remote_track_unmuted",
+            Self::AudioPlaybackStarted => "audio_playback_started",
+            Self::AudioPlaybackBlocked => "audio_playback_blocked",
+            Self::AudioPlaybackFailed => "audio_playback_failed",
             Self::AudioCaptureFailed => "audio_capture_failed",
+            Self::VideoCaptureFailed => "video_capture_failed",
+            Self::ClipboardSyncStarted => "clipboard_sync_started",
+            Self::ClipboardTextSent => "clipboard_text_sent",
+            Self::ClipboardTextReceived => "clipboard_text_received",
             Self::ClipboardSyncFailed => "clipboard_sync_failed",
+            Self::VideoTrackCreated => "video_track_created",
+            Self::VideoFramesSubmitted => "video_frames_submitted",
+            Self::WebRtcStateConnected => "webrtc_state_connected",
+            Self::WebRtcStateDisconnected => "webrtc_state_disconnected",
+            Self::WebRtcStateFailed => "webrtc_state_failed",
+            Self::WebRtcStatsReadFailed => "webrtc_stats_read_failed",
+            Self::InputMessagesProcessed => "input_messages_processed",
             Self::QualityReduced => "quality_reduced",
             Self::QualityRestored => "quality_restored",
         }
@@ -138,7 +226,29 @@ fn append_diagnostic_log(app: &AppHandle, event: DiagnosticEvent) -> Result<(), 
     append_diagnostic_log_file(&path, event)
 }
 
+fn append_diagnostic_log_values(
+    app: &AppHandle,
+    event: DiagnosticEvent,
+    value: Option<u64>,
+    value2: Option<u64>,
+) -> Result<(), String> {
+    let _guard = DIAGNOSTIC_LOG_LOCK
+        .lock()
+        .map_err(|_| "诊断日志状态不可用。".to_string())?;
+    let path = diagnostic_log_path(app)?;
+    append_diagnostic_log_file_values(&path, event, value, value2)
+}
+
 fn append_diagnostic_log_file(path: &Path, event: DiagnosticEvent) -> Result<(), String> {
+    append_diagnostic_log_file_values(path, event, None, None)
+}
+
+fn append_diagnostic_log_file_values(
+    path: &Path,
+    event: DiagnosticEvent,
+    value: Option<u64>,
+    value2: Option<u64>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "无法定位诊断日志目录。".to_string())?;
@@ -154,19 +264,31 @@ fn append_diagnostic_log_file(path: &Path, event: DiagnosticEvent) -> Result<(),
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("无法读取系统时间：{error}"))?
-        .as_secs();
+        .as_millis();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| format!("无法打开诊断日志：{error}"))?;
-    writeln!(file, "{timestamp}\t{}", event.as_str())
-        .map_err(|error| format!("无法写入诊断日志：{error}"))
+    write!(file, "{timestamp}\t{}", event.as_str())
+        .map_err(|error| format!("无法写入诊断日志：{error}"))?;
+    if let Some(value) = value {
+        write!(file, "\tvalue={value}").map_err(|error| format!("无法写入诊断日志：{error}"))?;
+    }
+    if let Some(value2) = value2 {
+        write!(file, "\tvalue2={value2}").map_err(|error| format!("无法写入诊断日志：{error}"))?;
+    }
+    writeln!(file).map_err(|error| format!("无法写入诊断日志：{error}"))
 }
 
 #[tauri::command]
-pub fn log_diagnostic_event(app: AppHandle, event: DiagnosticEvent) -> Result<(), String> {
-    append_diagnostic_log(&app, event)
+pub fn log_diagnostic_event(
+    app: AppHandle,
+    event: DiagnosticEvent,
+    value: Option<u64>,
+    value2: Option<u64>,
+) -> Result<(), String> {
+    append_diagnostic_log_values(&app, event, value, value2)
 }
 
 #[tauri::command]
@@ -1505,6 +1627,7 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         peer_address: peer.to_string(),
         controller_name: controller_name.clone(),
     };
+    let _ = append_diagnostic_log(&state.app, DiagnosticEvent::ConnectionRequestReceived);
     let trusted = match read_trusted_ips(&state.app) {
         Ok(ips) => ips.contains(&peer.ip()),
         Err(error) => {
@@ -1579,6 +1702,7 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         approved
     };
     if !approved {
+        let _ = append_diagnostic_log(&state.app, DiagnosticEvent::ConnectionRequestRejected);
         let _ = socket
             .send(Message::Text(
                 serde_json::json!({"type": "error", "message": "连接未获批准"})
@@ -1593,6 +1717,7 @@ async fn handle_connection(mut socket: WebSocket, peer: SocketAddr, state: Serve
         return;
     }
 
+    let _ = append_diagnostic_log(&state.app, DiagnosticEvent::ConnectionRequestApproved);
     let _ = state.app.emit("agent-peer-identity", peer.ip().to_string());
     let _ = append_diagnostic_log(&state.app, DiagnosticEvent::AgentConnectionApproved);
     if send_signal(&mut socket, serde_json::json!({"type": "approved"}))
@@ -1648,6 +1773,14 @@ enum WebRtcSignal {
     State(PeerConnectionState),
     CaptureError(String),
     AudioStatus(String),
+    AudioRtpStats {
+        packets: u64,
+        bytes: u64,
+    },
+    AudioRtpMissing,
+    VideoFramesSubmitted(u64),
+    StatsReadFailed,
+    InputMessagesProcessed(u64),
     EncoderStatus {
         codec: Option<String>,
         encoder: Option<String>,
@@ -1679,12 +1812,14 @@ impl StatsWorker {
         let stopping = Arc::clone(&self.stopping);
         self.thread = Some(thread::spawn(move || {
             let mut audio_report_tick = 0_u8;
+            let mut audio_log_tick = 0_u8;
             while !stopping.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_secs(1));
                 if stopping.load(Ordering::Acquire) {
                     break;
                 }
                 audio_report_tick = (audio_report_tick + 1) % 3;
+                audio_log_tick = (audio_log_tick + 1) % 15;
                 if let Ok(stats) = peer_connection.get_stats() {
                     if let Some(video) = stats
                         .outbound_rtp
@@ -1701,13 +1836,31 @@ impl StatsWorker {
                         .outbound_rtp
                         .iter()
                         .find(|stream| stream.kind == StreamKind::Audio)
-                        && audio_report_tick == 0
                     {
-                        let codec = audio.codec_mime_type.as_deref().unwrap_or("codec pending");
-                        let _ = signals.send(WebRtcSignal::AudioStatus(format!(
-                            "音频发送链路：{} 包，{} 字节（{}）。",
-                            audio.packets_sent, audio.bytes_sent, codec
-                        )));
+                        if audio_report_tick == 0 {
+                            let codec = audio.codec_mime_type.as_deref().unwrap_or("codec pending");
+                            let _ = signals.send(WebRtcSignal::AudioStatus(format!(
+                                "音频发送链路：{} 包，{} 字节（{}）。",
+                                audio.packets_sent, audio.bytes_sent, codec
+                            )));
+                        }
+                        if audio_log_tick == 0 {
+                            let _ = signals.send(WebRtcSignal::AudioRtpStats {
+                                packets: audio.packets_sent,
+                                bytes: audio.bytes_sent,
+                            });
+                        }
+                    } else if audio_report_tick == 0 {
+                        let _ = signals.send(WebRtcSignal::AudioStatus(
+                            "WebRTC 尚未创建音频 RTP 发送流。".to_string(),
+                        ));
+                        if audio_log_tick == 0 {
+                            let _ = signals.send(WebRtcSignal::AudioRtpMissing);
+                        }
+                    }
+                } else {
+                    if audio_log_tick == 0 {
+                        let _ = signals.send(WebRtcSignal::StatsReadFailed);
                     }
                 }
             }
@@ -1749,6 +1902,7 @@ impl CaptureWorker {
         }
         let stopping = Arc::clone(&self.stopping);
         self.thread = Some(thread::spawn(move || {
+            let mut submitted_frames = 0_u64;
             while !stopping.load(Ordering::Acquire) {
                 let started = std::time::Instant::now();
                 match capture_bgra(settings.max_width, display_id) {
@@ -1758,6 +1912,11 @@ impl CaptureWorker {
                         {
                             let _ = signals.send(WebRtcSignal::CaptureError(error.to_string()));
                             break;
+                        }
+                        submitted_frames += 1;
+                        if submitted_frames % 300 == 0 {
+                            let _ =
+                                signals.send(WebRtcSignal::VideoFramesSubmitted(submitted_frames));
                         }
                     }
                     Err(error) => {
@@ -1834,11 +1993,23 @@ impl AudioCaptureWorker {
             let _ = app.emit("agent-audio-status", &status);
             let _ = signals.send(WebRtcSignal::AudioStatus(status));
             let mut audio_detected = false;
+            let mut pushed_frames = 0_u64;
             while !stopping.load(Ordering::Acquire) {
                 if let Some(chunk) = stream.poll_chunk() {
                     let has_audio = chunk.peak >= 0.001;
                     if has_audio != audio_detected {
                         audio_detected = has_audio;
+                        let event = if audio_detected {
+                            DiagnosticEvent::AudioCaptureSignalDetected
+                        } else {
+                            DiagnosticEvent::AudioCaptureSignalMissing
+                        };
+                        let _ = append_diagnostic_log_values(
+                            &app,
+                            event,
+                            Some((chunk.peak.max(0.0) * 1000.0) as u64),
+                            None,
+                        );
                         let status = if audio_detected {
                             "被控端已检测到系统声音，正在发送。".to_string()
                         } else {
@@ -1854,6 +2025,22 @@ impl AudioCaptureWorker {
                         let _ = app.emit("agent-audio-status", &status);
                         let _ = signals.send(WebRtcSignal::AudioStatus(status));
                         break;
+                    }
+                    pushed_frames += 1;
+                    if pushed_frames % 500 == 0 {
+                        let _ = append_diagnostic_log_values(
+                            &app,
+                            DiagnosticEvent::AudioFramesSubmitted,
+                            Some(pushed_frames),
+                            Some(u64::from(audio_detected)),
+                        );
+                    }
+                    if pushed_frames % 100 == 0 {
+                        let status = format!(
+                            "已向 WebRTC 音轨提交 {pushed_frames} 个系统音频帧，等待 RTP 发送统计。"
+                        );
+                        let _ = app.emit("agent-audio-status", &status);
+                        let _ = signals.send(WebRtcSignal::AudioStatus(status));
                     }
                 } else {
                     thread::sleep(Duration::from_millis(2));
@@ -1908,6 +2095,7 @@ async fn run_webrtc_session(
         Ok(result) => result?,
         Err(_) => return Err("等待控制端 WebRTC offer 超时".to_string()),
     };
+    let _ = append_diagnostic_log(&state.app, DiagnosticEvent::SignalingOfferReceived);
 
     let selected_display_id = *state
         .remote
@@ -1976,6 +2164,9 @@ async fn run_webrtc_session(
     let input_for_channel = input_sender.clone();
     let channels_for_peer = Arc::clone(&data_channels);
     let signals_for_peer = signal_sender.clone();
+    let input_message_count = Arc::new(AtomicU64::new(0));
+    let input_count_for_peer = Arc::clone(&input_message_count);
+    let signals_for_input = signal_sender.clone();
     let signals_for_state = signal_sender.clone();
     let observer = PeerConnectionObserver::new()
         .on_ice_candidate(move |candidate| {
@@ -1986,6 +2177,8 @@ async fn run_webrtc_session(
         })
         .on_data_channel(move |channel| {
             let input_for_this_channel = input_for_channel.clone();
+            let input_message_count = Arc::clone(&input_count_for_peer);
+            let signals_for_input = signals_for_input.clone();
             channel.on_message(move |data, binary| {
                 if binary {
                     return;
@@ -1994,6 +2187,10 @@ async fn run_webrtc_session(
                     && let Ok(command) = serde_json::from_str::<ClientMessage>(text)
                     && is_input_message(&command)
                 {
+                    let count = input_message_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count % 1000 == 0 {
+                        let _ = signals_for_input.send(WebRtcSignal::InputMessagesProcessed(count));
+                    }
                     let _ = input_for_this_channel.send(command);
                 }
             });
@@ -2035,6 +2232,7 @@ async fn run_webrtc_session(
             .create_video_track("lantern-screen")
             .map_err(|error| format!("无法创建屏幕视频轨道：{error}"))?,
     );
+    let _ = append_diagnostic_log(&state.app, DiagnosticEvent::VideoTrackCreated);
     let system_audio_enabled = system_audio_requested
         && state
             .remote
@@ -2061,6 +2259,9 @@ async fn run_webrtc_session(
     } else {
         None
     };
+    if audio_track.is_some() {
+        let _ = append_diagnostic_log(&state.app, DiagnosticEvent::AudioTrackCreated);
+    }
     for transceiver in peer_connection.transceivers() {
         match transceiver.kind() {
             MediaKind::Video => {
@@ -2090,6 +2291,36 @@ async fn run_webrtc_session(
     let answer = peer_connection
         .create_answer()
         .map_err(|error| format!("无法创建 WebRTC answer：{error}"))?;
+    if system_audio_requested {
+        let mut in_audio_section = false;
+        let audio_sendonly = answer.sdp.lines().any(|line| {
+            if line.starts_with("m=") {
+                in_audio_section = line.starts_with("m=audio ");
+            }
+            in_audio_section && line.trim() == "a=sendonly"
+        });
+        let status = if !system_audio_enabled {
+            "控制端请求了系统声音，但被控端的共享设置未启用。".to_string()
+        } else if audio_sendonly {
+            "WebRTC 音频已协商为发送方向，等待音频 RTP 数据。".to_string()
+        } else {
+            "WebRTC answer 未协商出音频发送方向，无法发送系统声音。".to_string()
+        };
+        let event = if audio_sendonly && system_audio_enabled {
+            DiagnosticEvent::AudioNegotiationSendOnly
+        } else {
+            DiagnosticEvent::AudioNegotiationMissing
+        };
+        let _ = append_diagnostic_log(&state.app, event);
+        send_signal(
+            socket,
+            serde_json::json!({"type": "audio_status", "status": status}),
+        )
+        .await
+        .map_err(|error| format!("发送音频协商状态失败：{error}"))?;
+    } else {
+        let _ = append_diagnostic_log(&state.app, DiagnosticEvent::AudioNegotiationNotRequested);
+    }
     peer_connection
         .set_local_description(&answer)
         .map_err(|error| format!("无法应用 WebRTC answer：{error}"))?;
@@ -2099,6 +2330,7 @@ async fn run_webrtc_session(
     )
     .await
     .map_err(|error| format!("无法发送 WebRTC answer：{error}"))?;
+    let _ = append_diagnostic_log(&state.app, DiagnosticEvent::WebRtcAnswerCreated);
 
     let mut capture_worker = CaptureWorker::new();
     let mut audio_capture_worker = AudioCaptureWorker::new();
@@ -2134,6 +2366,8 @@ async fn run_webrtc_session(
     let mut file_approval_deadline = None;
     let mut file_receive_deadline = None;
     let mut peer_disconnect_deadline = None;
+    let mut received_ice_candidates = 0_u64;
+    let mut sent_ice_candidates = 0_u64;
 
     loop {
         tokio::select! {
@@ -2142,6 +2376,13 @@ async fn run_webrtc_session(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::IceCandidate { candidate, sdp_mid, sdp_mline_index }) => {
+                                received_ice_candidates += 1;
+                                let _ = append_diagnostic_log_values(
+                                    &state.app,
+                                    DiagnosticEvent::IceCandidateReceived,
+                                    Some(received_ice_candidates),
+                                    None,
+                                );
                                 peer_connection
                                     .add_ice_candidate(&IceCandidate {
                                         candidate,
@@ -2161,6 +2402,12 @@ async fn run_webrtc_session(
                                         .load(Ordering::Acquire) =>
                             {
                                 if text.len() <= MAX_CLIPBOARD_TEXT_SIZE {
+                                    let _ = append_diagnostic_log_values(
+                                        &state.app,
+                                        DiagnosticEvent::ClipboardTextReceived,
+                                        Some(text.len() as u64),
+                                        None,
+                                    );
                                     state.app.emit("remote-clipboard-offer", ClipboardOffer { text })
                                         .map_err(|error| format!("无法显示剪贴板接收请求：{error}"))?;
                                 } else {
@@ -2186,6 +2433,12 @@ async fn run_webrtc_session(
                                 size,
                                 sha256,
                             }) => {
+                                let _ = append_diagnostic_log_values(
+                                    &state.app,
+                                    DiagnosticEvent::FileTransferOfferReceived,
+                                    Some(size),
+                                    None,
+                                );
                                 let valid_offer = is_valid_file_offer(
                                     &transfer_id,
                                     &file_name,
@@ -2364,6 +2617,16 @@ async fn run_webrtc_session(
                                             return Err("续传进度超过文件长度".to_string());
                                         }
                                         *is_accepted = accepted;
+                                        let _ = append_diagnostic_log_values(
+                                            &state.app,
+                                            if accepted {
+                                                DiagnosticEvent::FileTransferAccepted
+                                            } else {
+                                                DiagnosticEvent::FileTransferRejected
+                                            },
+                                            Some(resume_offset),
+                                            Some(*size),
+                                        );
                                         state.app.emit(
                                             "agent-file-transfer-decision",
                                             serde_json::json!({
@@ -2402,6 +2665,16 @@ async fn run_webrtc_session(
                                     .as_ref()
                                     .is_some_and(|incoming| incoming.receiver.metadata.transfer_id == transfer_id)
                                 {
+                                    let control_event = match action.as_str() {
+                                        "pause" => DiagnosticEvent::FileTransferPaused,
+                                        "resume" => DiagnosticEvent::FileTransferResumed,
+                                        "cancel" => DiagnosticEvent::FileTransferCancelled,
+                                        _ => unreachable!(),
+                                    };
+                                    let _ = append_diagnostic_log(
+                                        &state.app,
+                                        control_event,
+                                    );
                                     match action.as_str() {
                                         "pause" => file_receive_deadline = None,
                                         "resume" => {
@@ -2429,6 +2702,16 @@ async fn run_webrtc_session(
                                     .as_ref()
                                     .is_some_and(|(active_id, _, _, _)| active_id == &transfer_id)
                                 {
+                                    let control_event = match action.as_str() {
+                                        "pause" => DiagnosticEvent::FileTransferPaused,
+                                        "resume" => DiagnosticEvent::FileTransferResumed,
+                                        "cancel" => DiagnosticEvent::FileTransferCancelled,
+                                        _ => unreachable!(),
+                                    };
+                                    let _ = append_diagnostic_log(
+                                        &state.app,
+                                        control_event,
+                                    );
                                     let _ = state.app.emit(
                                         "agent-file-transfer-control",
                                         serde_json::json!({
@@ -2455,6 +2738,10 @@ async fn run_webrtc_session(
                                         active_id == &transfer_id && *accepted && size == sent
                                     },
                                 ) {
+                                    let completed_size = agent_file_transfer
+                                        .as_ref()
+                                        .map(|(_, size, _, _)| *size)
+                                        .unwrap_or_default();
                                     let _ = state.app.emit(
                                         "agent-file-transfer-complete",
                                         serde_json::json!({
@@ -2462,9 +2749,11 @@ async fn run_webrtc_session(
                                         }),
                                     );
                                     agent_file_transfer = None;
-                                    let _ = append_diagnostic_log(
+                                    let _ = append_diagnostic_log_values(
                                         &state.app,
                                         DiagnosticEvent::FileTransferCompleted,
+                                        Some(completed_size),
+                                        None,
                                     );
                                     let _ = state.app.emit(
                                         "agent-file-transfer-status",
@@ -2531,6 +2820,16 @@ async fn run_webrtc_session(
                         }
                         let previous_size = incoming.receiver.received_size;
                         append_partial_file_chunk(&mut incoming.receiver, &chunk)?;
+                        if incoming.receiver.received_size / (5 * 1024 * 1024)
+                            > previous_size / (5 * 1024 * 1024)
+                        {
+                            let _ = append_diagnostic_log_values(
+                                &state.app,
+                                DiagnosticEvent::FileTransferProgress,
+                                Some(incoming.receiver.received_size),
+                                Some(incoming.receiver.metadata.expected_size),
+                            );
+                        }
                         if incoming.receiver.received_size / (1024 * 1024)
                             > previous_size / (1024 * 1024)
                         {
@@ -2569,6 +2868,20 @@ async fn run_webrtc_session(
                 if let Some(incoming) = agent_incoming_file_transfer.as_mut() {
                     let accepted = decision.unwrap_or(false);
                     incoming.accepted = accepted;
+                    let _ = append_diagnostic_log_values(
+                        &state.app,
+                        if accepted {
+                            DiagnosticEvent::FileTransferAccepted
+                        } else {
+                            DiagnosticEvent::FileTransferRejected
+                        },
+                        Some(if accepted {
+                            incoming.receiver.received_size
+                        } else {
+                            0
+                        }),
+                        Some(incoming.receiver.metadata.expected_size),
+                    );
                     if accepted {
                         file_receive_deadline =
                             Some(tokio::time::Instant::now() + Duration::from_secs(30));
@@ -2598,6 +2911,10 @@ async fn run_webrtc_session(
                 file_approval_receiver = None;
                 file_approval_deadline = None;
                 if let Some(incoming) = agent_incoming_file_transfer.take() {
+                    let _ = append_diagnostic_log(
+                        &state.app,
+                        DiagnosticEvent::FileTransferRejected,
+                    );
                     send_signal(
                         socket,
                         serde_json::json!({
@@ -2618,6 +2935,12 @@ async fn run_webrtc_session(
             } => {
                 file_receive_deadline = None;
                 if let Some(incoming) = agent_incoming_file_transfer.take() {
+                    let _ = append_diagnostic_log_values(
+                        &state.app,
+                        DiagnosticEvent::FileTransferFailed,
+                        Some(incoming.receiver.received_size),
+                        Some(incoming.receiver.metadata.expected_size),
+                    );
                     send_signal(socket, serde_json::json!({
                         "type": "file_transfer_error",
                         "transfer_id": incoming.receiver.metadata.transfer_id,
@@ -2630,6 +2953,13 @@ async fn run_webrtc_session(
             signal = signal_receiver.recv() => {
                 match signal {
                     Some(WebRtcSignal::Candidate(candidate)) => {
+                        sent_ice_candidates += 1;
+                        let _ = append_diagnostic_log_values(
+                            &state.app,
+                            DiagnosticEvent::IceCandidateSent,
+                            Some(sent_ice_candidates),
+                            None,
+                        );
                         send_signal(socket, serde_json::json!({
                             "type": "ice_candidate",
                             "candidate": candidate.candidate,
@@ -2641,6 +2971,10 @@ async fn run_webrtc_session(
                     }
                     Some(WebRtcSignal::State(PeerConnectionState::Connected)) => {
                         peer_disconnect_deadline = None;
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::WebRtcStateConnected,
+                        );
                         let _ = append_diagnostic_log(
                             &state.app,
                             DiagnosticEvent::AgentConnectionEstablished,
@@ -2690,10 +3024,18 @@ async fn run_webrtc_session(
                         stats_worker.start(Arc::clone(&peer_connection), signal_sender.clone());
                     }
                     Some(WebRtcSignal::State(PeerConnectionState::Failed | PeerConnectionState::Closed)) => {
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::WebRtcStateFailed,
+                        );
                         return Err("WebRTC 媒体连接已失败或关闭".to_string());
                     }
                     Some(WebRtcSignal::State(PeerConnectionState::Disconnected)) => {
                         if peer_disconnect_deadline.is_none() {
+                            let _ = append_diagnostic_log(
+                                &state.app,
+                                DiagnosticEvent::WebRtcStateDisconnected,
+                            );
                             let _ = append_diagnostic_log(
                                 &state.app,
                                 DiagnosticEvent::AgentConnectionInterrupted,
@@ -2704,7 +3046,19 @@ async fn run_webrtc_session(
                     }
                     Some(WebRtcSignal::State(_)) => {}
                     Some(WebRtcSignal::CaptureError(error)) => {
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::VideoCaptureFailed,
+                        );
                         return Err(format!("屏幕采集或视频编码失败：{error}"));
+                    }
+                    Some(WebRtcSignal::VideoFramesSubmitted(frames)) => {
+                        let _ = append_diagnostic_log_values(
+                            &state.app,
+                            DiagnosticEvent::VideoFramesSubmitted,
+                            Some(frames),
+                            None,
+                        );
                     }
                     Some(WebRtcSignal::AudioStatus(status)) => {
                         let _ = state.app.emit("agent-audio-status", &status);
@@ -2717,6 +3071,34 @@ async fn run_webrtc_session(
                         )
                         .await
                         .map_err(|error| format!("发送系统声音状态失败：{error}"))?;
+                    }
+                    Some(WebRtcSignal::AudioRtpStats { packets, bytes }) => {
+                        let _ = append_diagnostic_log_values(
+                            &state.app,
+                            DiagnosticEvent::AudioOutboundRtpStats,
+                            Some(packets),
+                            Some(bytes),
+                        );
+                    }
+                    Some(WebRtcSignal::AudioRtpMissing) => {
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::AudioOutboundRtpMissing,
+                        );
+                    }
+                    Some(WebRtcSignal::StatsReadFailed) => {
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::WebRtcStatsReadFailed,
+                        );
+                    }
+                    Some(WebRtcSignal::InputMessagesProcessed(count)) => {
+                        let _ = append_diagnostic_log_values(
+                            &state.app,
+                            DiagnosticEvent::InputMessagesProcessed,
+                            Some(count),
+                            None,
+                        );
                     }
                     Some(WebRtcSignal::EncoderStatus { codec, encoder, hardware }) => {
                         let acceleration = match hardware {
@@ -2745,6 +3127,12 @@ async fn run_webrtc_session(
             }
             text = clipboard_receiver.recv(), if clipboard_enabled => {
                 if let Some(text) = text {
+                    let _ = append_diagnostic_log_values(
+                        &state.app,
+                        DiagnosticEvent::ClipboardTextSent,
+                        Some(text.len() as u64),
+                        None,
+                    );
                     send_signal(socket, serde_json::json!({
                         "type": "clipboard_offer",
                         "text": text,
@@ -4061,12 +4449,41 @@ mod tests {
             "audio_capture_started"
         );
         assert_eq!(
+            DiagnosticEvent::AudioOutboundRtpStats.as_str(),
+            "audio_outbound_rtp_stats"
+        );
+        assert_eq!(
             DiagnosticEvent::AudioCaptureFailed.as_str(),
             "audio_capture_failed"
         );
         assert!(
             serde_json::from_str::<DiagnosticEvent>(r#""device_address:192.168.1.2""#).is_err()
         );
+    }
+
+    #[test]
+    fn diagnostic_log_records_only_fixed_events_and_numeric_metrics() {
+        let directory =
+            std::env::temp_dir().join(format!("lantern-log-metrics-{}", Uuid::new_v4()));
+        let path = directory.join("lantern.log");
+
+        append_diagnostic_log_file_values(
+            &path,
+            DiagnosticEvent::AudioOutboundRtpStats,
+            Some(12),
+            Some(4096),
+        )
+        .unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let mut fields = contents.trim().split('\t');
+        let timestamp = fields.next().unwrap();
+        assert!(timestamp.parse::<u128>().is_ok());
+        assert_eq!(fields.next(), Some("audio_outbound_rtp_stats"));
+        assert_eq!(fields.next(), Some("value=12"));
+        assert_eq!(fields.next(), Some("value2=4096"));
+        assert_eq!(fields.next(), None);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
