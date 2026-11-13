@@ -145,6 +145,36 @@ function formatFileSize(bytes: number): string {
   return `${bytes} 字节`;
 }
 
+/** 侧栏设备图标：取设备名（主机名）的首个字符，英文字母转大写。 */
+function deviceInitial(name: string): string {
+  const first = Array.from(name.trim())[0];
+  return first ? first.toUpperCase() : "?";
+}
+
+/** 读取本机主机名，作为连接时告诉被控端的控制端名称；读取失败时使用通用名称。 */
+async function readControllerName(): Promise<string> {
+  if (!isTauri()) return "Lantern 控制端";
+  try {
+    const info = await invoke<LocalDeviceInfo>("get_local_device_info");
+    return info.name.trim() || "Lantern 控制端";
+  } catch {
+    return "Lantern 控制端";
+  }
+}
+
+/** 右上角「?」弹出的功能列表。 */
+const FEATURE_LIST: { title: string; detail: string }[] = [
+  { title: "局域网发现与添加", detail: "自动发现运行被控端的电脑，或手动输入局域网地址。" },
+  { title: "远程查看与键鼠控制", detail: "被控端本机批准后才开始共享画面并接受键盘、鼠标操作。" },
+  { title: "独立控制窗口与全屏", detail: "在单独窗口中操作远程电脑，支持原生全屏。" },
+  { title: "多显示器选择", detail: "在应用设置中选择被控端要共享的显示器。" },
+  // { title: "系统声音", detail: "可选将被控端的系统声音同步到控制端播放。" },
+  { title: "剪贴板同步", detail: "两端均开启后自动同步文本，每次连接首次需确认。" },
+  { title: "大文件传输", detail: "双向发送最大 100 GiB 文件，支持暂停、断点续传与 SHA-256 分段校验。" },
+  { title: "信任设备", detail: "勾选信任后，该控制端后续连接自动批准，可在设置中移除。" },
+  { title: "诊断日志", detail: "仅记录固定事件和数值，便于排查连接与传输问题。" },
+];
+
 function sleep(milliseconds: number) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -327,6 +357,39 @@ function App() {
     }
   });
   const [showLocalInfo, setShowLocalInfo] = useState(false);
+  const [localInfoPlacement, setLocalInfoPlacement] = useState<"sidebar" | "topbar">("sidebar");
+  const [showFeatureList, setShowFeatureList] = useState(false);
+  const sidebarLocalInfoRef = useRef<HTMLDivElement>(null);
+  const topbarActionsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    void loadLocalDeviceInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!showLocalInfo && !showFeatureList) return;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (
+        target &&
+        (sidebarLocalInfoRef.current?.contains(target) || topbarActionsRef.current?.contains(target))
+      ) return;
+      setShowLocalInfo(false);
+      setShowFeatureList(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setShowLocalInfo(false);
+      setShowFeatureList(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showLocalInfo, showFeatureList]);
   const [localDeviceInfo, setLocalDeviceInfo] = useState<LocalDeviceInfo | null>(null);
   const [localInfoError, setLocalInfoError] = useState("");
   const [isLoadingLocalInfo, setIsLoadingLocalInfo] = useState(false);
@@ -1450,9 +1513,20 @@ function App() {
     }
   }
 
-  async function toggleLocalInfo() {
-    const shouldOpen = !showLocalInfo;
+  async function loadLocalDeviceInfo() {
+    if (!isTauri()) return;
+    try {
+      setLocalDeviceInfo(await invoke<LocalDeviceInfo>("get_local_device_info"));
+    } catch {
+      // 头像回退为默认字母；打开本机信息时会显示具体错误。
+    }
+  }
+
+  async function toggleLocalInfo(placement: "sidebar" | "topbar" = "sidebar") {
+    const shouldOpen = !(showLocalInfo && localInfoPlacement === placement);
+    setLocalInfoPlacement(placement);
     setShowLocalInfo(shouldOpen);
+    setShowFeatureList(false);
     setCopyAddressStatus("");
     if (!shouldOpen || !isTauri()) return;
 
@@ -1725,11 +1799,14 @@ function App() {
       const socket = new WebSocket(endpoint);
       socket.binaryType = "arraybuffer";
       connectionRef.current = socket;
-      socket.onopen = () => {
+      const controllerName = readControllerName();
+      socket.onopen = async () => {
         setConnectionStatus("waitingApproval");
+        const deviceName = await controllerName;
+        if (socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({
           type: "hello",
-          device_name: "Lantern 控制端",
+          device_name: deviceName,
           quality: videoQuality,
           clipboard_enabled: clipboardEnabled,
           system_audio_enabled: playRemoteSystemAudio,
@@ -2869,6 +2946,39 @@ function App() {
     sendInput({ type: "release_all" });
   }
 
+  const localInfoContent = (
+    <>
+        <strong>本机信息</strong>
+        {isLoadingLocalInfo ? (
+          <p>正在读取设备信息…</p>
+        ) : localInfoError ? (
+          <p className="popover-error">{localInfoError}</p>
+        ) : localDeviceInfo ? (
+          <>
+            <span className="popover-label">设备名称</span>
+            <code>{localDeviceInfo.name}</code>
+            <span className="popover-label">局域网地址</span>
+            <div className="popover-address">
+              <code>{localDeviceInfo.address}</code>
+              <button
+                className="icon-button small"
+                type="button"
+                aria-label="复制本机地址"
+                title="复制地址"
+                onClick={() => void copyLocalAddress()}
+              >
+                <Icon name="copy" />
+              </button>
+            </div>
+            {copyAddressStatus && <span className="popover-copy-status">{copyAddressStatus}</span>}
+          </>
+        ) : (
+          <p>请在 Lantern 桌面应用中查看本机网络信息。</p>
+        )}
+    </>
+  );
+  const localInitial = localDeviceInfo ? deviceInitial(localDeviceInfo.name) : "L";
+
   return (
     <main className={`app-shell${standaloneDeviceId ? " standalone-mode" : ""}${isNativeFullscreen ? " native-remote-fullscreen" : ""}`}>
       <aside className="sidebar">
@@ -2908,7 +3018,7 @@ function App() {
                 onClick={() => setActiveId(device.id)}
                 type="button"
               >
-                <span className="device-dot" />
+                <span className="device-dot" aria-hidden="true">{deviceInitial(device.name)}</span>
                 <span className="device-nav-copy">
                   <span className="device-nav-name">{device.name}</span>
                   <span className="device-nav-address">{device.address}</span>
@@ -2922,50 +3032,24 @@ function App() {
           </div>
         </div>
 
-        <div className="sidebar-bottom">
+        <div className="sidebar-bottom" ref={sidebarLocalInfoRef}>
           <div className="lan-status">
             <span className="lan-status-dot" />
             <span>仅限本地网络</span>
           </div>
-          {showLocalInfo && (
+          {showLocalInfo && localInfoPlacement === "sidebar" && (
             <div className="sidebar-info-popover" role="dialog" aria-label="本机信息">
-              <strong>本机信息</strong>
-              {isLoadingLocalInfo ? (
-                <p>正在读取设备信息…</p>
-              ) : localInfoError ? (
-                <p className="popover-error">{localInfoError}</p>
-              ) : localDeviceInfo ? (
-                <>
-                  <span className="popover-label">设备名称</span>
-                  <code>{localDeviceInfo.name}</code>
-                  <span className="popover-label">局域网地址</span>
-                  <div className="popover-address">
-                    <code>{localDeviceInfo.address}</code>
-                    <button
-                      className="icon-button small"
-                      type="button"
-                      aria-label="复制本机地址"
-                      title="复制地址"
-                      onClick={() => void copyLocalAddress()}
-                    >
-                      <Icon name="copy" />
-                    </button>
-                  </div>
-                  {copyAddressStatus && <span className="popover-copy-status">{copyAddressStatus}</span>}
-                </>
-              ) : (
-                <p>请在 Lantern 桌面应用中查看本机网络信息。</p>
-              )}
+              {localInfoContent}
             </div>
           )}
           <div className="sidebar-bottom-actions">
             <button
               className="profile profile-button"
               type="button"
-              aria-expanded={showLocalInfo}
-              onClick={() => void toggleLocalInfo()}
+              aria-expanded={showLocalInfo && localInfoPlacement === "sidebar"}
+              onClick={() => void toggleLocalInfo("sidebar")}
             >
-              <span className="avatar">L</span>
+              <span className="avatar">{localInitial}</span>
               <span className="profile-copy">
                 <strong>本机工作区</strong>
                 <span>点击查看设备信息</span>
@@ -2992,7 +3076,7 @@ function App() {
             <Icon name="chevron" />
             <strong>设备桌面</strong>
           </div>
-          <div className="topbar-actions">
+          <div className="topbar-actions" ref={topbarActionsRef}>
             <span className="connection-state">
               <span className={connectionStatus === "connected" ? "lan-status-dot" : "offline-dot"} />
               {connectionStatus === "connected" ? "已连接" : connectionStatus === "waitingApproval" ? "等待本机批准" : "未连接"}
@@ -3001,12 +3085,44 @@ function App() {
             <button
               className="icon-button help-button"
               type="button"
-              aria-label="帮助"
-              title="局域网桌面"
+              aria-label="功能介绍"
+              aria-expanded={showFeatureList}
+              title="功能介绍"
+              onClick={() => {
+                setShowFeatureList((open) => !open);
+                setShowLocalInfo(false);
+              }}
             >
               <Icon name="help" />
             </button>
-            <span className="top-avatar">A</span>
+            <button
+              className="top-avatar"
+              type="button"
+              aria-label="本机信息"
+              aria-expanded={showLocalInfo && localInfoPlacement === "topbar"}
+              title={localDeviceInfo ? `本机：${localDeviceInfo.name}` : "本机信息"}
+              onClick={() => void toggleLocalInfo("topbar")}
+            >
+              {localInitial}
+            </button>
+            {showFeatureList && (
+              <div className="topbar-popover feature-popover" role="dialog" aria-label="功能介绍">
+                <strong>Lantern 功能</strong>
+                <ul className="feature-list">
+                  {FEATURE_LIST.map((feature) => (
+                    <li key={feature.title}>
+                      <span className="feature-title">{feature.title}</span>
+                      <span className="feature-detail">{feature.detail}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {showLocalInfo && localInfoPlacement === "topbar" && (
+              <div className="topbar-popover sidebar-info-popover" role="dialog" aria-label="本机信息">
+                {localInfoContent}
+              </div>
+            )}
           </div>
         </header>
 
