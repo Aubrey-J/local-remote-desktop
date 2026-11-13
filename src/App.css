@@ -53,7 +53,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); ou
 .standalone-mode .remote-window-actions { display: flex; align-items: center; gap: 14px; }
 .standalone-mode .page-heading, .standalone-mode .notice, .standalone-mode .agent-status,
 .standalone-mode .desktop-heading, .standalone-mode .selection-bar, .standalone-mode .workspace-footer { display: none; }
-.standalone-mode .connection-error { margin: 0 0 12px; }
+.standalone-mode .connection-error { margin: 0; }
+.standalone-mode .workspace-notices { margin-bottom: 12px; }
 .standalone-mode .device-grid, .standalone-mode .device-grid.layout-list { display: block; flex: 1; min-height: 0; }
 .standalone-mode .device-card { display: flex; height: 100%; flex-direction: column; }
 .standalone-mode .device-card:not(.standalone-device-card) { display: none; }
@@ -295,12 +296,15 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .notice p { flex: 1; margin: 0; color: #9da892; font-size: 10px; line-height: 1.4; }
 .notice strong { margin-right: 6px; color: #c6d8b8; font-weight: 600; }
 .notice-tag { padding: 3px 6px; color: #a4bd8d; background: #273122; border-radius: 4px; font: 9px "DM Mono", monospace; }
-.storage-error { margin: -26px 0 30px; padding: 10px 12px; color: #f1aaa3; background: #2b1d1d; border: 1px solid #57302e; border-radius: 7px; font-size: 11px; }
-.agent-status, .connection-error { display: flex; align-items: center; gap: 9px; margin: -25px 0 30px; padding: 10px 12px; color: #aab2bd; background: #1b1e24; border: 1px solid #2c323b; border-radius: 8px; font-size: 10px; }
+.workspace-notices { display: flex; flex: 0 0 auto; flex-direction: column; gap: 8px; margin: 0 0 16px; }
+.workspace-notices:empty { display: none; }
+.workspace-notices > * { margin: 0; }
+.storage-error { margin: 0; padding: 10px 12px; color: #f1aaa3; background: #2b1d1d; border: 1px solid #57302e; border-radius: 7px; font-size: 11px; }
+.agent-status, .connection-error { display: flex; align-items: center; gap: 9px; margin: 0; padding: 10px 12px; color: #aab2bd; background: #1b1e24; border: 1px solid #2c323b; border-radius: 8px; font-size: 10px; }
 .agent-status-on { color: #bed5aa; background: #1a2118; border-color: #34442b; }
 .agent-status code { margin-left: auto; color: #c5dfa9; font: 10px "DM Mono", monospace; }
 .agent-clipboard-button { flex: 0 0 auto; white-space: nowrap; }
-.agent-clipboard-status { margin: -20px 0 24px; }
+.agent-clipboard-status { margin: 0; }
 .connection-error { justify-content: space-between; color: #f0aaa3; background: #2b1d1d; border-color: #57302e; }
 .text-button { padding: 3px 6px; color: inherit; background: transparent; border: 0; cursor: pointer; font-size: 10px; }
 .desktop-heading { flex: 0 0 auto; margin-bottom: 12px; }
@@ -362,7 +366,11 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .layout-list .device-card-footer { align-self: end; padding: 9px 12px 4px; }
 .layout-list .device-menu-wrap { grid-column: 2; justify-self: end; margin: -35px 9px 5px 0; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
-.transfer-status { margin-top: 12px; padding: 10px 12px; color: #bdc9b1; background: #1a2117; border: 1px solid #303b28; border-radius: 7px; font-size: 10px; overflow-wrap: anywhere; }
+.transfer-status { display: flex; align-items: flex-start; gap: 8px; margin-top: 12px; padding: 10px 12px; color: #bdc9b1; background: #1a2117; border: 1px solid #303b28; border-radius: 7px; font-size: 10px; overflow-wrap: anywhere; }
+.transfer-status > span { flex: 1; min-width: 0; line-height: 1.5; }
+.status-dismiss { display: grid; place-items: center; flex: 0 0 18px; width: 18px; height: 18px; margin: -1px -4px 0 0; padding: 0; color: #8f9a86; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
+.status-dismiss:hover { color: #e3ead9; background: #2a3324; }
+.status-dismiss svg { width: 12px; height: 12px; }
 .device-card { overflow: hidden; min-width: 0; background: #191c22; border: 1px solid #2a2f38; border-radius: 10px; transition: border-color .15s ease, box-shadow .15s ease; }
 .device-card.card-active { border-color: #81a959; box-shadow: 0 0 0 1px #a6e86c1c; }
 .preview-area {
@@ -451,7 +459,7 @@ h1 { margin-bottom: 8px; color: #edf0f4; font: 700 29px/1.2 "Manrope", sans-seri
 .discovered-device-list button:hover { background: #242a21; border-color: #536447; }
 .discovered-device-list strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .discovered-device-list span { color: #8d96a3; font: 9px "DM Mono", monospace; white-space: nowrap; }
-.file-transfer-controls { display: flex; align-items: center; gap: 8px; margin: 10px 0; padding: 9px 10px; background: #1b2025; border: 1px solid #343c43; border-radius: 8px; }
+.file-transfer-controls { display: flex; align-items: center; gap: 8px; margin: 0; padding: 9px 10px; background: #1b2025; border: 1px solid #343c43; border-radius: 8px; }
 .file-transfer-progress { display: grid; flex: 1; min-width: 0; gap: 4px; }
 .file-transfer-progress strong { overflow: hidden; color: #dfe5ec; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .file-transfer-progress span { color: #8f99a5; font: 9px "DM Mono", monospace; }

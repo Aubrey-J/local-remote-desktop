@@ -48,7 +48,7 @@ const DEFAULT_PORT: u16 = 4200;
 const DISCOVERY_PORT: u16 = 42011;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_FILE_TRANSFER_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+const MAX_FILE_TRANSFER_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 const MAX_CLIPBOARD_TEXT_SIZE: usize = 48 * 1024;
 const MAX_FILE_CHUNK_SIZE: usize = 1024 * 1024;
 // WebSocket 单条消息上限：需容纳 1 MiB 文件数据块。
@@ -431,6 +431,7 @@ impl ClipboardWatcher {
             };
             let mut watching = false;
             let mut read_error_reported = false;
+            let mut consecutive_read_failures = 0_u32;
             let mut oversized_text_reported = false;
             while !stopping_for_thread.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(400));
@@ -438,13 +439,21 @@ impl ClipboardWatcher {
                     watching = false;
                     continue;
                 }
-                let text = match clipboard.get_text() {
-                    Ok(text) => {
+                let text = match read_clipboard_text(&mut clipboard) {
+                    Ok(Some(text)) => {
                         read_error_reported = false;
+                        consecutive_read_failures = 0;
                         text
                     }
+                    // 剪贴板里不是文本（图片、文件或为空），不同步也不算错误。
+                    Ok(None) => {
+                        consecutive_read_failures = 0;
+                        continue;
+                    }
                     Err(_) => {
-                        if !read_error_reported {
+                        // Windows 剪贴板常被其他程序短暂占用，连续失败约 4 秒才提示。
+                        consecutive_read_failures += 1;
+                        if consecutive_read_failures >= 10 && !read_error_reported {
                             let _ =
                                 append_diagnostic_log(&app, DiagnosticEvent::ClipboardSyncFailed);
                             let _ = app.emit(
@@ -527,12 +536,27 @@ pub fn send_agent_clipboard(
         .map_err(|_| "剪贴板发送通道已关闭，请重新连接后重试。".to_string())
 }
 
-#[tauri::command]
-pub fn get_system_clipboard_text() -> Result<String, String> {
+/// 读取剪贴板文本。剪贴板中没有文本（为空、是图片或文件）时返回 None；
+/// 剪贴板被其他程序短暂占用时（Windows 上很常见）稍等后重试。
+fn read_clipboard_text(clipboard: &mut Clipboard) -> Result<Option<String>, arboard::Error> {
+    let mut attempts = 0;
+    loop {
+        match clipboard.get_text() {
+            Ok(text) => return Ok(Some(text)),
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(arboard::Error::ClipboardOccupied) if attempts < 5 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[tauri::command(async)]
+pub fn get_system_clipboard_text() -> Result<Option<String>, String> {
     let mut clipboard = Clipboard::new().map_err(|error| format!("无法访问系统剪贴板：{error}"))?;
-    clipboard
-        .get_text()
-        .map_err(|error| format!("无法读取系统剪贴板：{error}"))
+    read_clipboard_text(&mut clipboard).map_err(|error| format!("无法读取系统剪贴板：{error}"))
 }
 
 #[derive(Clone, Serialize)]
@@ -547,21 +571,20 @@ pub struct AvailableDisplay {
 
 #[tauri::command]
 pub fn get_available_displays() -> Result<Vec<AvailableDisplay>, String> {
-    let screens =
-        screenshots::Screen::all().map_err(|error| format!("无法读取显示器列表：{error}"))?;
-    Ok(screens
+    let monitors = capture_monitors().map_err(|error| format!("无法读取显示器列表：{error}"))?;
+    Ok(monitors
         .iter()
         .enumerate()
-        .map(|(index, screen)| AvailableDisplay {
-            id: screen.display_info.id,
-            name: if screen.display_info.is_primary {
+        .map(|(index, monitor)| AvailableDisplay {
+            id: monitor.id,
+            name: if monitor.primary {
                 format!("显示器 {}（主屏幕）", index + 1)
             } else {
                 format!("显示器 {}", index + 1)
             },
-            width: screen.display_info.width,
-            height: screen.display_info.height,
-            primary: screen.display_info.is_primary,
+            width: monitor.width,
+            height: monitor.height,
+            primary: monitor.primary,
         })
         .collect())
 }
@@ -583,10 +606,10 @@ pub fn set_capture_display(
     display_id: Option<u32>,
 ) -> Result<(), String> {
     if let Some(display_id) = display_id
-        && !screenshots::Screen::all()
+        && !capture_monitors()
             .map_err(|error| format!("无法验证显示器：{error}"))?
             .iter()
-            .any(|screen| screen.display_info.id == display_id)
+            .any(|monitor| monitor.id == display_id)
     {
         return Err("所选显示器当前不可用，请刷新显示器列表。".to_string());
     }
@@ -715,7 +738,7 @@ pub fn begin_agent_file_transfer(
     // 被控端发送时文件由 Rust 传输任务持有，这里直接从登记表中取走，传完自动释放。
     let source = take_prepared_outgoing_file(remote.inner(), &source_id)?;
     if !is_valid_file_offer(&transfer_id, &source.file_name, source.size, &source.sha256) {
-        return Err("文件名或大小无效，文件不能超过 10 GiB。".to_string());
+        return Err("文件名或大小无效，文件不能超过 100 GiB。".to_string());
     }
     let sender = remote
         .file_sender
@@ -771,7 +794,7 @@ pub fn begin_controller_file_receive(
     if !is_valid_file_offer(&transfer_id, &file_name, size, &sha256)
         || !is_valid_segment_hashes(size, &segment_hashes)
     {
-        return Err("文件接收请求无效或超过 10 GiB 限制".to_string());
+        return Err("文件接收请求无效或超过 100 GiB 限制".to_string());
     }
     let mut pending = remote
         .controller_file_receiver
@@ -3185,6 +3208,9 @@ async fn run_webrtc_session(
                             .await
                             .map_err(|error| format!("发送连接状态失败：{error}"))?;
                         let _ = state.app.emit("agent-connection-state", true);
+                        let _ = state
+                            .app
+                            .emit("agent-status", format!("控制端「{controller_name}」已连接。"));
                         capture_worker.start(
                             Arc::clone(&video_track),
                             signal_sender.clone(),
@@ -4104,7 +4130,7 @@ fn prepare_outgoing_file_source(
     }
     let size = metadata.len();
     if size == 0 || size > MAX_FILE_TRANSFER_SIZE {
-        return Err("文件必须大于 0 且不超过 10 GiB。".to_string());
+        return Err("文件必须大于 0 且不超过 100 GiB。".to_string());
     }
     let file_name = path
         .file_name()
@@ -4324,24 +4350,21 @@ fn is_lan_address(address: IpAddr) -> bool {
 }
 
 fn capture_dimensions(display_id: Option<u32>) -> Result<(u32, u32, i32, i32), String> {
-    let screen = selected_screen(display_id)?;
-    Ok((
-        screen.display_info.width,
-        screen.display_info.height,
-        screen.display_info.x,
-        screen.display_info.y,
-    ))
+    let monitor = selected_monitor(display_id)?;
+    Ok((monitor.width, monitor.height, monitor.x, monitor.y))
 }
 
 fn capture_bgra(max_width: u32, display_id: Option<u32>) -> Result<(Vec<u8>, u32, u32), String> {
-    let screen = selected_screen(display_id)?;
-    let screenshot = screen
-        .capture()
+    let monitor = selected_monitor(display_id)?;
+    let pixels = monitor
+        .monitor
+        .capture_image()
         .map_err(|error| format!("屏幕采集失败：{error}"))?;
-    let width = screenshot.width();
-    let height = screenshot.height();
-    let pixels = image::RgbaImage::from_raw(width, height, screenshot.into_raw())
-        .ok_or_else(|| "屏幕图像格式无效".to_string())?;
+    let width = pixels.width();
+    let height = pixels.height();
+    if width == 0 || height == 0 {
+        return Err("屏幕图像格式无效".to_string());
+    }
 
     let scale = (max_width as f64 / width as f64).min(1.0);
     let (frame_width, frame_height) = (
@@ -4360,23 +4383,63 @@ fn capture_bgra(max_width: u32, display_id: Option<u32>) -> Result<(Vec<u8>, u32
     Ok((output, frame_width, frame_height))
 }
 
-fn selected_screen(display_id: Option<u32>) -> Result<screenshots::Screen, String> {
-    let screens = screenshots::Screen::all().map_err(|error| format!("无法读取屏幕：{error}"))?;
-    let screen = if let Some(display_id) = display_id {
-        screens
-            .iter()
-            .find(|screen| screen.display_info.id == display_id)
-            .copied()
-            .ok_or_else(|| "所选显示器已不可用，请在应用设置中重新选择。".to_string())?
-    } else {
-        screens
-            .iter()
-            .find(|screen| screen.display_info.is_primary)
-            .or_else(|| screens.first())
-            .copied()
-            .ok_or_else(|| "没有找到可采集的屏幕".to_string())?
-    };
-    Ok(screen)
+/// 一台可采集的显示器。坐标和尺寸与原 screenshots 库口径一致：
+/// macOS 为逻辑点（CGDisplayBounds），Windows 为物理像素，Linux 为按缩放换算后的值，
+/// 供键鼠坐标映射使用。
+struct CaptureMonitor {
+    id: u32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    primary: bool,
+    monitor: xcap::Monitor,
+}
+
+fn capture_monitors() -> Result<Vec<CaptureMonitor>, String> {
+    let monitors = xcap::Monitor::all().map_err(|error| error.to_string())?;
+    let mut result = Vec::with_capacity(monitors.len());
+    for monitor in monitors {
+        let describe = |error: xcap::XCapError| format!("无法读取显示器信息：{error}");
+        result.push(CaptureMonitor {
+            id: stable_monitor_id(&monitor).map_err(describe)?,
+            x: monitor.x().map_err(describe)?,
+            y: monitor.y().map_err(describe)?,
+            width: monitor.width().map_err(describe)?,
+            height: monitor.height().map_err(describe)?,
+            primary: monitor.is_primary().map_err(describe)?,
+            monitor,
+        });
+    }
+    Ok(result)
+}
+
+/// Windows 上 xcap 的 id 是 HMONITOR 句柄，重启或插拔显示器后会变。
+/// 这里沿用原 screenshots 库的算法（设备名的 fxhash），让已保存的显示器选择继续有效。
+#[cfg(target_os = "windows")]
+fn stable_monitor_id(monitor: &xcap::Monitor) -> xcap::XCapResult<u32> {
+    Ok(fxhash::hash32(monitor.name()?.as_bytes()))
+}
+
+/// macOS 为 CGDirectDisplayID，Linux 为 RandR output id，与原 screenshots 库相同。
+#[cfg(not(target_os = "windows"))]
+fn stable_monitor_id(monitor: &xcap::Monitor) -> xcap::XCapResult<u32> {
+    monitor.id()
+}
+
+fn selected_monitor(display_id: Option<u32>) -> Result<CaptureMonitor, String> {
+    let monitors = capture_monitors().map_err(|error| format!("无法读取屏幕：{error}"))?;
+    if let Some(display_id) = display_id {
+        return monitors
+            .into_iter()
+            .find(|monitor| monitor.id == display_id)
+            .ok_or_else(|| "所选显示器已不可用，请在应用设置中重新选择。".to_string());
+    }
+    let primary = monitors.iter().position(|monitor| monitor.primary).unwrap_or(0);
+    monitors
+        .into_iter()
+        .nth(primary)
+        .ok_or_else(|| "没有找到可采集的屏幕".to_string())
 }
 
 #[derive(Default)]
@@ -4887,14 +4950,23 @@ mod tests {
     }
 
     #[test]
-    fn ten_gibibyte_files_are_within_the_transfer_limit() {
+    fn hundred_gibibyte_files_are_within_the_transfer_limit() {
         let hash = format!("{:x}", Sha256::digest(b"large"));
-        assert!(is_valid_file_offer(
-            "transfer-1",
-            "disk.img",
-            10 * 1024 * 1024 * 1024,
-            &hash,
-        ));
+        let size = 100 * 1024 * 1024 * 1024;
+        assert!(is_valid_file_offer("transfer-1", "disk.img", size, &hash));
+        // 100 GiB 的分段哈希列表（1600 段）放进文件请求后仍远小于单条消息上限。
+        let segments = vec!["a".repeat(64); size.div_ceil(FILE_SEGMENT_SIZE) as usize];
+        assert!(is_valid_segment_hashes(size, &segments));
+        let offer = serde_json::json!({
+            "type": "file_offer",
+            "transfer_id": "transfer-1",
+            "file_name": "disk.img",
+            "size": size,
+            "sha256": hash,
+            "segment_hashes": segments,
+        })
+        .to_string();
+        assert!(offer.len() < MAX_SIGNAL_MESSAGE_SIZE);
     }
 
     #[test]

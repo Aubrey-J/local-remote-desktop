@@ -132,7 +132,7 @@ const SYSTEM_AUDIO_SHARE_STORAGE_KEY = "lantern.share-system-audio";
 const CAPTURE_DISPLAY_STORAGE_KEY = "lantern.capture-display";
 const DEFAULT_PORT = "4200";
 const FILE_TRANSFER_IDENTITIES_KEY = "lantern.file-transfer-identities";
-const MAX_FILE_TRANSFER_SIZE = 10 * 1024 * 1024 * 1024;
+const MAX_FILE_TRANSFER_SIZE = 100 * 1024 * 1024 * 1024;
 const FILE_SEND_BUFFER_HIGH_WATER = 8 * 1024 * 1024;
 const FILE_PROGRESS_LOG_STEP = 64 * 1024 * 1024;
 const FILE_PROGRESS_UI_INTERVAL_MS = 200;
@@ -390,6 +390,7 @@ function App() {
   const agentPeerIdentityRef = useRef("");
   const lastClipboardTextRef = useRef<string | null>(null);
   const clipboardReadErrorReportedRef = useRef(false);
+  const clipboardReadFailuresRef = useRef(0);
 
   function updateActiveFileTransfer(next: ActiveFileTransfer | null) {
     activeFileTransferRef.current = next;
@@ -585,9 +586,11 @@ function App() {
     let cancelled = false;
     const pollClipboard = async () => {
       try {
-        const text = await invoke<string>("get_system_clipboard_text");
+        const text = await invoke<string | null>("get_system_clipboard_text");
+        clipboardReadFailuresRef.current = 0;
         clipboardReadErrorReportedRef.current = false;
-        if (cancelled) return;
+        // 剪贴板里不是文本（图片、文件或为空）时不同步，也不算错误。
+        if (cancelled || text === null) return;
         const previous = lastClipboardTextRef.current;
         if (previous === null) {
           lastClipboardTextRef.current = text;
@@ -606,6 +609,9 @@ function App() {
         lastClipboardTextRef.current = text;
       } catch (cause) {
         if (cancelled || clipboardReadErrorReportedRef.current) return;
+        // Windows 剪贴板经常被其他程序短暂占用，连续失败约 3 秒才提示。
+        clipboardReadFailuresRef.current += 1;
+        if (clipboardReadFailuresRef.current < 6) return;
         clipboardReadErrorReportedRef.current = true;
         const detail = cause instanceof Error ? cause.message : String(cause);
         setTransferStatus(`无法监视本机剪贴板：${detail}`);
@@ -915,7 +921,10 @@ function App() {
       listen<boolean>("agent-connection-state", (event) => {
         if (!isMainWindow) return;
         setAgentConnected(event.payload);
-        if (!event.payload) {
+        if (event.payload) {
+          // 受信任设备会自动批准、不会经过批准弹窗，这里统一把状态更新为已连接。
+          setAgentStatus("控制端已连接。");
+        } else {
           agentPeerIdentityRef.current = "";
           clipboardSessionAllowedRef.current = false;
           if (pendingAgentFileRef.current) {
@@ -938,11 +947,11 @@ function App() {
         );
         if (clipboardSessionAllowedRef.current) {
           void invoke("set_system_clipboard_text", { text: event.payload.text })
-            .then(() => setTransferStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
+            .then(() => setAgentClipboardStatus("已将对端文本写入本机剪贴板（本次连接已授权）。"))
             .catch((cause: unknown) => {
               const detail = cause instanceof Error ? cause.message : String(cause);
               recordDiagnosticEvent("clipboard_sync_failed");
-              setTransferStatus(`无法写入剪贴板：${detail}`);
+              setAgentClipboardStatus(`无法写入剪贴板：${detail}`);
             })
             .finally(restoreRemoteFocus);
         } else {
@@ -966,7 +975,7 @@ function App() {
         if (activeFileTransferRef.current?.transferId === event.payload.transferId) {
           updateActiveFileTransfer(null);
         }
-        setTransferStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
+        setAgentClipboardStatus(`已接收 ${event.payload.fileName}，保存至 ${event.payload.savedPath}`);
       }),
     ]).then(([requestListener, requestEndedListener, statusListener, agentConnectionListener, peerIdentityListener, clipboardListener, fileListener, receivedListener]) => {
       if (cancelled) {
@@ -2303,7 +2312,11 @@ function App() {
       return;
     }
     try {
-      const text = await invoke<string>("get_system_clipboard_text");
+      const text = await invoke<string | null>("get_system_clipboard_text");
+      if (text === null) {
+        setTransferStatus("剪贴板里没有文本内容。");
+        return;
+      }
       if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
         setTransferStatus("剪贴板内容超过 48 KiB，未发送。");
         return;
@@ -2326,7 +2339,11 @@ function App() {
       return;
     }
     try {
-      const text = await invoke<string>("get_system_clipboard_text");
+      const text = await invoke<string | null>("get_system_clipboard_text");
+      if (text === null) {
+        setAgentClipboardStatus("剪贴板里没有文本内容。");
+        return;
+      }
       if (new TextEncoder().encode(text).byteLength > 48 * 1024) {
         setAgentClipboardStatus("剪贴板内容超过 48 KiB，未发送。");
         return;
@@ -2481,11 +2498,14 @@ function App() {
           });
         }
       }
-      setTransferStatus(accepted ? `正在接收 ${offer.fileName}…` : `已拒绝接收 ${offer.fileName}。`);
+      // 被控端（to-agent）的提示放在顶部状态区，控制端的提示放在设备卡片里。
+      const report = offer.direction === "to-agent" ? setAgentClipboardStatus : setTransferStatus;
+      report(accepted ? `正在接收 ${offer.fileName}…` : `已拒绝接收 ${offer.fileName}。`);
     } catch (cause) {
       const detail = cause instanceof Error ? cause.message : String(cause);
       recordDiagnosticEvent("file_transfer_failed");
-      setTransferStatus(`无法处理文件请求：${detail}`);
+      const report = offer.direction === "to-agent" ? setAgentClipboardStatus : setTransferStatus;
+      report(`无法处理文件请求：${detail}`);
     } finally {
       restoreRemoteFocus();
     }
@@ -2503,7 +2523,7 @@ function App() {
       if (!prepared) return;
       registeredSourceId = prepared.sourceId;
       if (prepared.size === 0 || prepared.size > MAX_FILE_TRANSFER_SIZE) {
-        setTransferStatus("文件必须大于 0 且不超过 10 GiB。");
+        setTransferStatus("文件必须大于 0 且不超过 100 GiB。");
         void invoke("release_outgoing_file", { sourceId: prepared.sourceId }).catch(() => undefined);
         return;
       }
@@ -2624,7 +2644,7 @@ function App() {
       const releasePrepared = () =>
         void invoke("release_outgoing_file", { sourceId: prepared.sourceId }).catch(() => undefined);
       if (prepared.size === 0 || prepared.size > MAX_FILE_TRANSFER_SIZE) {
-        setAgentClipboardStatus("文件必须大于 0 且不超过 10 GiB。");
+        setAgentClipboardStatus("文件必须大于 0 且不超过 100 GiB。");
         releasePrepared();
         return;
       }
@@ -3043,69 +3063,85 @@ function App() {
             </p>
             <span className="notice-tag">局域网</span>
           </div>
-          {storageError && (
-            <div className="storage-error" role="alert">{storageError}</div>
-          )}
-          {agentStatus && (
-            <div className={`agent-status${agentRunning ? " agent-status-on" : ""}`} role="status">
-              <span className={agentRunning ? "lan-status-dot" : "offline-dot"} />
-              <span>{agentStatus}</span>
-              {agentRunning && <code>{agentAddress}</code>}
-              {agentConnected && (
-                <>
-                  <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
-                    发送本机剪贴板
-                  </button>
-                  <button className="text-button agent-clipboard-button" onClick={() => void selectAgentFile()} type="button">
-                    发送文件到控制端
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-          {agentClipboardStatus && <div className="transfer-status agent-clipboard-status" role="status">{agentClipboardStatus}</div>}
-          {activeFileTransfer && (
-            <div className="file-transfer-controls" role="group" aria-label="文件传输控制">
-              <div className="file-transfer-progress">
-                <strong>{activeFileTransfer.fileName}</strong>
-                <span>
-                  {activeFileTransfer.paused ? "已暂停" : activeFileTransfer.mode === "send" ? "正在发送" : "正在接收"}
-                  {" · "}
-                  {formatFileSize(activeFileTransfer.transferred)} / {formatFileSize(activeFileTransfer.size)}
-                </span>
-                <progress value={activeFileTransfer.transferred} max={activeFileTransfer.size} />
+          {/* 状态提示区：位于标题和设备列表之间，各条提示等距排列，不再使用负外边距叠放。 */}
+          <div className="workspace-notices">
+            {storageError && (
+              <div className="storage-error" role="alert">{storageError}</div>
+            )}
+            {agentStatus && (
+              <div className={`agent-status${agentRunning ? " agent-status-on" : ""}`} role="status">
+                <span className={agentRunning ? "lan-status-dot" : "offline-dot"} />
+                <span>{agentStatus}</span>
+                {agentRunning && <code>{agentAddress}</code>}
+                {agentConnected && (
+                  <>
+                    <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
+                      发送本机剪贴板
+                    </button>
+                    <button className="text-button agent-clipboard-button" onClick={() => void selectAgentFile()} type="button">
+                      发送文件到控制端
+                    </button>
+                  </>
+                )}
               </div>
-              <button
-                className="secondary-button"
-                onClick={() => void controlActiveFileTransfer(activeFileTransfer.paused ? "resume" : "pause")}
-                type="button"
-              >
-                {activeFileTransfer.paused ? "继续" : "暂停"}
-              </button>
-              <button
-                className="transfer-cancel-button"
-                onClick={() => void controlActiveFileTransfer("cancel")}
-                type="button"
-              >
-                取消传输
-              </button>
-            </div>
-          )}
-          {connectionStatus === "error" && connectionError && (
-            <div className="connection-error" role="alert">
-              <span>{connectionError}</span>
-              {activeDevice && (
+            )}
+            {agentClipboardStatus && (
+              <div className="transfer-status agent-clipboard-status" role="status">
+                <span>{agentClipboardStatus}</span>
                 <button
-                  className="text-button"
-                  onClick={() => connectToDevice(activeDevice)}
+                  className="status-dismiss"
+                  type="button"
+                  aria-label="关闭提示"
+                  title="关闭"
+                  onClick={() => setAgentClipboardStatus("")}
+                >
+                  <Icon name="close" />
+                </button>
+              </div>
+            )}
+            {activeFileTransfer && (
+              <div className="file-transfer-controls" role="group" aria-label="文件传输控制">
+                <div className="file-transfer-progress">
+                  <strong>{activeFileTransfer.fileName}</strong>
+                  <span>
+                    {activeFileTransfer.paused ? "已暂停" : activeFileTransfer.mode === "send" ? "正在发送" : "正在接收"}
+                    {" · "}
+                    {formatFileSize(activeFileTransfer.transferred)} / {formatFileSize(activeFileTransfer.size)}
+                  </span>
+                  <progress value={activeFileTransfer.transferred} max={activeFileTransfer.size} />
+                </div>
+                <button
+                  className="secondary-button"
+                  onClick={() => void controlActiveFileTransfer(activeFileTransfer.paused ? "resume" : "pause")}
                   type="button"
                 >
-                  重试连接
+                  {activeFileTransfer.paused ? "继续" : "暂停"}
                 </button>
-              )}
-              <button className="text-button" onClick={() => disconnectFromDevice()} type="button">关闭</button>
-            </div>
-          )}
+                <button
+                  className="transfer-cancel-button"
+                  onClick={() => void controlActiveFileTransfer("cancel")}
+                  type="button"
+                >
+                  取消传输
+                </button>
+              </div>
+            )}
+            {connectionStatus === "error" && connectionError && (
+              <div className="connection-error" role="alert">
+                <span>{connectionError}</span>
+                {activeDevice && (
+                  <button
+                    className="text-button"
+                    onClick={() => connectToDevice(activeDevice)}
+                    type="button"
+                  >
+                    重试连接
+                  </button>
+                )}
+                <button className="text-button" onClick={() => disconnectFromDevice()} type="button">关闭</button>
+              </div>
+            )}
+          </div>
 
           <div className="section-heading desktop-heading">
             <div>
@@ -3155,6 +3191,8 @@ function App() {
           ) : (
             <div className={`device-grid layout-${deviceLayout}`}>
               {devices.map((device, index) => {
+                // 卡片提示只显示在当前连接（或选中）的设备上，避免每张卡片重复出现。
+                const transferStatusDeviceId = standaloneDeviceId ?? connectionDeviceId ?? activeId ?? devices[0]?.id;
                 const standaloneStatus = standaloneWindowStatuses[device.id];
                 const standaloneStatusLabel = standaloneStatus === "opening"
                   ? "正在打开独立窗口"
@@ -3330,7 +3368,24 @@ function App() {
                       )}
                     </button>
                   )}
-                  {transferStatus && <div className="transfer-status" role="status">{transferStatus}</div>}
+                  {transferStatus && device.id === transferStatusDeviceId && (
+                    <div className="transfer-status" role="status">
+                      <span>{transferStatus}</span>
+                      <button
+                        className="status-dismiss"
+                        type="button"
+                        aria-label="关闭提示"
+                        title="关闭"
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setTransferStatus("");
+                        }}
+                      >
+                        <Icon name="close" />
+                      </button>
+                    </div>
+                  )}
                   <div className="device-card-footer">
                     <span className="device-card-icon"><Icon name="desktop" /></span>
                     <span className="device-card-copy">

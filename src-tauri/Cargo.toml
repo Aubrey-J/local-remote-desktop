@@ -31,10 +31,14 @@ if-addrs = "0.13"
 axum = { version = "0.8", features = ["ws"] }
 enigo = "0.3"
 image = { version = "0.25", default-features = false }
-screenshots = "0.8"
+xcap = "0.9"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 reactor-webrtc = "=0.23.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# 仅用于生成与原 screenshots 库一致的显示器 ID。
+fxhash = "0.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
