@@ -64,6 +64,7 @@ pub fn run() {
     let close_to_tray_for_close = Arc::clone(&close_to_tray);
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(remote_state)
         .manage(Arc::clone(&close_to_tray))
         .setup(move |app| {
@@ -131,9 +132,10 @@ pub fn run() {
             remote::get_capture_display,
             remote::set_capture_display,
             remote::set_clipboard_sync_enabled,
+            remote::prepare_outgoing_file,
+            remote::read_outgoing_file_chunk,
+            remote::release_outgoing_file,
             remote::begin_agent_file_transfer,
-            remote::send_agent_file_chunk,
-            remote::finish_agent_file_transfer,
             remote::control_agent_file_transfer,
             remote::begin_controller_file_receive,
             remote::append_controller_file_chunk,

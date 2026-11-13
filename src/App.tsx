@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
@@ -41,6 +41,8 @@ type FileOffer = {
   fileName: string;
   size: number;
   sha256: string;
+  /** 每 64 MiB 分段的 SHA-256；用于校验失败时只回退到损坏段。旧版发送端为空。 */
+  segmentHashes?: string[];
   receivedBytes: number;
   direction: "to-agent" | "from-agent";
 };
@@ -60,9 +62,18 @@ type IncomingFileTransfer = {
   fileName: string;
   size: number;
   receivedBytes: number;
+  lastProgressUpdate: number;
   writeQueue: Promise<void>;
   writeError: string | null;
 };
+type PreparedFile = {
+  sourceId: string;
+  fileName: string;
+  size: number;
+  sha256: string;
+  segmentHashes: string[];
+};
+type OutgoingFileSession = PreparedFile & { paused: boolean; cancelled: boolean };
 type KeyboardLock = { lock: (keys?: string[]) => Promise<void>; unlock: () => void };
 
 type RemoteStatus = "idle" | "connecting" | "waitingApproval" | "connected" | "error";
@@ -121,6 +132,32 @@ const SYSTEM_AUDIO_SHARE_STORAGE_KEY = "lantern.share-system-audio";
 const CAPTURE_DISPLAY_STORAGE_KEY = "lantern.capture-display";
 const DEFAULT_PORT = "4200";
 const FILE_TRANSFER_IDENTITIES_KEY = "lantern.file-transfer-identities";
+const MAX_FILE_TRANSFER_SIZE = 10 * 1024 * 1024 * 1024;
+const FILE_SEND_BUFFER_HIGH_WATER = 8 * 1024 * 1024;
+const FILE_PROGRESS_LOG_STEP = 64 * 1024 * 1024;
+const FILE_PROGRESS_UI_INTERVAL_MS = 200;
+const FILE_TRANSFER_CANCELLED = "文件传输已取消。";
+
+function formatFileSize(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MiB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${bytes} 字节`;
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+/** 由 Rust 弹出文件选择框并流式计算 SHA-256；前端不读取文件内容。用户取消选择时返回 null。 */
+async function pickOutgoingFile(report: (message: string) => void): Promise<PreparedFile | null> {
+  const progress = new Channel<{ fileName: string; hashedBytes: number; size: number }>();
+  progress.onmessage = ({ fileName, hashedBytes, size }) => {
+    const percent = size > 0 ? Math.floor((hashedBytes / size) * 100) : 0;
+    report(`正在校验 ${fileName}：${percent}%（${formatFileSize(hashedBytes)} / ${formatFileSize(size)}）`);
+  };
+  return invoke<PreparedFile | null>("prepare_outgoing_file", { onProgress: progress });
+}
 
 function readDeviceLayout(): DeviceLayout {
   const value = localStorage.getItem(LAYOUT_STORAGE_KEY);
@@ -183,10 +220,6 @@ function forgetFileTransfer(transferId: string) {
   localStorage.setItem(FILE_TRANSFER_IDENTITIES_KEY, JSON.stringify(identities));
 }
 
-async function hashFile(file: File): Promise<string> {
-  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 function readClipboardEnabled() {
   return localStorage.getItem(CLIPBOARD_STORAGE_KEY) === "true";
 }
@@ -352,16 +385,8 @@ function App() {
   const [pendingClipboardOffer, setPendingClipboardOffer] = useState<ClipboardOffer | null>(null);
   const [activeFileTransfer, setActiveFileTransfer] = useState<ActiveFileTransfer | null>(null);
   const [transferStatus, setTransferStatus] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const agentFileInputRef = useRef<HTMLInputElement>(null);
   const incomingFileTransferRef = useRef<IncomingFileTransfer | null>(null);
-  const pendingAgentFileRef = useRef<{
-    transferId: string;
-    file: File;
-    sha256: string;
-    paused: boolean;
-    cancelled: boolean;
-  } | null>(null);
+  const pendingAgentFileRef = useRef<(OutgoingFileSession & { transferId: string }) | null>(null);
   const agentPeerIdentityRef = useRef("");
   const lastClipboardTextRef = useRef<string | null>(null);
   const clipboardReadErrorReportedRef = useRef(false);
@@ -369,6 +394,21 @@ function App() {
   function updateActiveFileTransfer(next: ActiveFileTransfer | null) {
     activeFileTransferRef.current = next;
     setActiveFileTransfer(next);
+  }
+
+  /** 结束一次控制端发送：移除会话，并让 Rust 收回该文件的读取登记。 */
+  function forgetFileSend(transferId: string) {
+    const session = pendingFileSendsRef.current.get(transferId);
+    pendingFileSendsRef.current.delete(transferId);
+    if (session) {
+      void invoke("release_outgoing_file", { sourceId: session.sourceId }).catch(() => undefined);
+    }
+  }
+
+  function forgetAllFileSends() {
+    for (const transferId of Array.from(pendingFileSendsRef.current.keys())) {
+      forgetFileSend(transferId);
+    }
   }
 
   function clearFileTransferIdentity(transferId: string) {
@@ -389,12 +429,7 @@ function App() {
   const connectionRecoveryTimerRef = useRef<number | null>(null);
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
   const pressedRemoteMouseButtonsRef = useRef<Set<string>>(new Set());
-  const pendingFileSendsRef = useRef<Map<string, {
-    file: File;
-    sha256: string;
-    paused: boolean;
-    cancelled: boolean;
-  }>>(new Map());
+  const pendingFileSendsRef = useRef<Map<string, OutgoingFileSession>>(new Map());
   const activeFileTransferRef = useRef<ActiveFileTransfer | null>(null);
   const clipboardSessionAllowedRef = useRef(false);
   const remoteStreamRef = useRef<MediaStream | null>(null);
@@ -1028,12 +1063,21 @@ function App() {
             updateActiveFileTransfer(null);
             setAgentClipboardStatus(payload.error);
           } else if (payload.accepted) {
-            void transmitAgentFile(pending.transferId, pending.file, payload.resumeOffset);
+            // 数据由 Rust 直接从磁盘读取并发送，这里只更新界面。
+            const active = activeFileTransferRef.current;
+            if (active?.transferId === pending.transferId) {
+              updateActiveFileTransfer({ ...active, transferred: payload.resumeOffset });
+            }
+            setAgentClipboardStatus(
+              payload.resumeOffset > 0
+                ? `正在发送 ${pending.fileName}，从 ${formatFileSize(payload.resumeOffset)} 处续传…`
+                : `正在发送 ${pending.fileName}…`,
+            );
           } else {
             recordDiagnosticEvent("file_transfer_failed");
             pendingAgentFileRef.current = null;
             updateActiveFileTransfer(null);
-            setAgentClipboardStatus(`${pending.file.name}：控制端拒绝接收。`);
+            setAgentClipboardStatus(`${pending.fileName}：控制端拒绝接收。`);
           }
         },
       ),
@@ -1091,14 +1135,18 @@ function App() {
           setAgentClipboardStatus("文件已成功送达控制端。");
         },
       ),
-      listen<{ transferId: string; message: string }>(
+      listen<{ transferId: string; message: string; local?: boolean }>(
         "agent-file-transfer-error",
         ({ payload }) => {
           if (pendingAgentFileRef.current?.transferId === payload.transferId) {
             pendingAgentFileRef.current = null;
             updateActiveFileTransfer(null);
           }
-          setAgentClipboardStatus(`文件接收端报告失败：${payload.message}。续传标识已保留。`);
+          setAgentClipboardStatus(
+            payload.local
+              ? `文件发送失败：${payload.message}续传标识已保留。`
+              : `文件接收端报告失败：${payload.message}。续传标识已保留。`,
+          );
         },
       ),
     ]).then(([decisionListener, statusListener, clipboardListener, controlListener, progressListener, completeListener, errorListener]) => {
@@ -1693,17 +1741,32 @@ function App() {
             socket.close();
             return;
           }
-          const active = activeFileTransferRef.current;
-          if (active?.transferId === incoming.transferId) {
-            updateActiveFileTransfer({ ...active, transferred: incoming.receivedBytes });
+          const now = performance.now();
+          if (
+            now - incoming.lastProgressUpdate >= FILE_PROGRESS_UI_INTERVAL_MS ||
+            incoming.receivedBytes === incoming.size
+          ) {
+            incoming.lastProgressUpdate = now;
+            const active = activeFileTransferRef.current;
+            if (active?.transferId === incoming.transferId) {
+              updateActiveFileTransfer({ ...active, transferred: incoming.receivedBytes });
+            }
           }
-          const chunk = Array.from(new Uint8Array(event.data));
+          // 以原始二进制请求体交给 Rust 落盘（不再转换成 JSON 数字数组），
+          // 落盘后向被控端确认进度，被控端据此做滑动窗口流控，避免本端内存堆积。
+          const chunk = new Uint8Array(event.data);
           incoming.writeQueue = incoming.writeQueue.then(async () => {
             if (incoming.writeError) return;
-            await invoke("append_controller_file_chunk", {
-              transferId: incoming.transferId,
-              bytes: chunk,
+            const persisted = await invoke<number>("append_controller_file_chunk", chunk, {
+              headers: { "x-transfer-id": incoming.transferId },
             });
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({
+                type: "file_ack",
+                transfer_id: incoming.transferId,
+                received: persisted,
+              }));
+            }
           }).catch((cause: unknown) => {
             incoming.writeError = cause instanceof Error ? cause.message : String(cause);
           });
@@ -1724,6 +1787,7 @@ function App() {
           file_name?: string;
           size?: number;
           sha256?: string;
+          segment_hashes?: unknown;
           resume_offset?: number;
         };
         try {
@@ -1790,13 +1854,18 @@ function App() {
           typeof message.sha256 === "string" &&
           /^[a-f0-9]{64}$/.test(message.sha256) &&
           message.size > 0 &&
-          message.size <= 100 * 1024 * 1024
+          message.size <= MAX_FILE_TRANSFER_SIZE
         ) {
+          const segmentHashes = Array.isArray(message.segment_hashes) &&
+            message.segment_hashes.every((hash) => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))
+            ? message.segment_hashes as string[]
+            : [];
           setPendingFileOffer({
             transferId: message.transfer_id,
             fileName: message.file_name,
             size: message.size,
             sha256: message.sha256,
+            segmentHashes,
             receivedBytes: 0,
             direction: "from-agent",
           });
@@ -1816,24 +1885,24 @@ function App() {
           const session = pendingFileSendsRef.current.get(message.transfer_id);
           if (!session) return;
           if (!message.accepted) {
-            pendingFileSendsRef.current.delete(message.transfer_id);
+            forgetFileSend(message.transfer_id);
             updateActiveFileTransfer(null);
-            setTransferStatus(`${session.file.name}：对端拒绝接收。`);
+            setTransferStatus(`${session.fileName}：对端拒绝接收。`);
           } else {
             const resumeOffset = message.resume_offset ?? 0;
-            if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0 || resumeOffset > session.file.size) {
+            if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0 || resumeOffset > session.size) {
               setTransferStatus("对端返回了无效的续传进度。");
               socket.close();
               return;
             }
-            void transmitFile(socket, message.transfer_id, session.file, resumeOffset);
+            void transmitFile(socket, message.transfer_id, resumeOffset);
           }
         } else if (message.type === "file_transfer_complete" && message.transfer_id) {
           const session = pendingFileSendsRef.current.get(message.transfer_id);
           if (session) {
             clearFileTransferIdentity(message.transfer_id);
-            pendingFileSendsRef.current.delete(message.transfer_id);
-            recordDiagnosticEvent("file_transfer_completed", session.file.size);
+            forgetFileSend(message.transfer_id);
+            recordDiagnosticEvent("file_transfer_completed", session.size);
           }
           setTransferStatus("文件已成功发送。");
           updateActiveFileTransfer(null);
@@ -1857,7 +1926,7 @@ function App() {
                   session.cancelled = true;
                   clearFileTransferIdentity(message.transfer_id);
                 }
-                pendingFileSendsRef.current.delete(message.transfer_id);
+                forgetFileSend(message.transfer_id);
               } else {
                 const incoming = incomingFileTransferRef.current;
                 if (incoming?.transferId === message.transfer_id) {
@@ -1877,7 +1946,7 @@ function App() {
         } else if (message.type === "file_transfer_error" && message.message) {
           const transferId = typeof message.transfer_id === "string" ? message.transfer_id : "";
           const sending = transferId ? pendingFileSendsRef.current.get(transferId) : undefined;
-          if (sending) pendingFileSendsRef.current.delete(transferId);
+          if (sending) forgetFileSend(transferId);
           const incoming = incomingFileTransferRef.current;
           if (incoming?.transferId === transferId) {
             incomingFileTransferRef.current = null;
@@ -1889,7 +1958,7 @@ function App() {
           recordDiagnosticEvent("file_transfer_failed");
           setTransferStatus(
             sending
-              ? `${sending.file.name}：${message.message}续传标识已保留，可重新连接后再次选择同一文件。`
+              ? `${sending.fileName}：${message.message}续传标识已保留，可重新连接后再次选择同一文件。`
               : message.message,
           );
         } else if (message.type === "clipboard_error" && message.message) {
@@ -1949,7 +2018,7 @@ function App() {
         if (pendingFileSendsRef.current.size > 0) {
           recordDiagnosticEvent("file_transfer_interrupted");
           setTransferStatus("连接已断开，续传进度已保留；重新连接后再次选择相同文件即可继续。");
-          pendingFileSendsRef.current.clear();
+          forgetAllFileSends();
         }
         updateActiveFileTransfer(null);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
@@ -2196,7 +2265,7 @@ function App() {
     remoteAudioStreamRef.current = null;
     if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     pendingRemoteCandidatesRef.current = [];
-    pendingFileSendsRef.current.clear();
+    forgetAllFileSends();
     updateActiveFileTransfer(null);
     clipboardSessionAllowedRef.current = false;
     setPendingClipboardOffer(null);
@@ -2358,12 +2427,14 @@ function App() {
               fileName: offer.fileName,
               size: offer.size,
               sha256: offer.sha256,
+              segmentHashes: offer.segmentHashes ?? [],
             });
             incomingFileTransferRef.current = {
               transferId: offer.transferId,
               fileName: offer.fileName,
               size: offer.size,
               receivedBytes: resumeOffset,
+              lastProgressUpdate: 0,
               writeQueue: Promise.resolve(),
               writeError: null,
             };
@@ -2420,35 +2491,37 @@ function App() {
     }
   }
 
-  async function selectFile(file: File | undefined) {
-    if (!file) return;
+  async function selectFile() {
     const socket = connectionRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setTransferStatus("请先连接到远程设备。");
       return;
     }
-    if (file.size === 0 || file.size > 100 * 1024 * 1024) {
-      setTransferStatus("文件必须大于 0 且不超过 100 MiB。");
-      return;
-    }
+    let registeredSourceId: string | null = null;
     try {
-      setTransferStatus(`正在校验 ${file.name}，请稍候…`);
-      const sha256 = await hashFile(file);
+      const prepared = await pickOutgoingFile(setTransferStatus);
+      if (!prepared) return;
+      registeredSourceId = prepared.sourceId;
+      if (prepared.size === 0 || prepared.size > MAX_FILE_TRANSFER_SIZE) {
+        setTransferStatus("文件必须大于 0 且不超过 10 GiB。");
+        void invoke("release_outgoing_file", { sourceId: prepared.sourceId }).catch(() => undefined);
+        return;
+      }
       const targetIdentity = connectionDeviceId ?? activeId ?? "remote-device";
-      const transferId = await getOrCreateFileTransferId(file.name, sha256, targetIdentity);
+      const transferId = await getOrCreateFileTransferId(prepared.fileName, prepared.sha256, targetIdentity);
       if (connectionRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
         throw new Error("校验完成时连接已关闭；续传标识已保留，请重新连接后再次选择文件。");
       }
       pendingFileSendsRef.current.set(transferId, {
-        file,
-        sha256,
+        ...prepared,
         paused: false,
         cancelled: false,
       });
+      registeredSourceId = null;
       updateActiveFileTransfer({
         transferId,
-        fileName: file.name,
-        size: file.size,
+        fileName: prepared.fileName,
+        size: prepared.size,
         transferred: 0,
         paused: false,
         path: "websocket",
@@ -2457,65 +2530,80 @@ function App() {
       socket.send(JSON.stringify({
         type: "file_offer",
         transfer_id: transferId,
-        file_name: file.name,
-        size: file.size,
-        sha256,
+        file_name: prepared.fileName,
+        size: prepared.size,
+        sha256: prepared.sha256,
+        segment_hashes: prepared.segmentHashes,
       }));
-      recordDiagnosticEvent("file_transfer_started", file.size);
-      setTransferStatus(`已请求发送 ${file.name}，等待对端批准。`);
+      recordDiagnosticEvent("file_transfer_started", prepared.size);
+      setTransferStatus(`已请求发送 ${prepared.fileName}，等待对端批准。`);
     } catch (cause) {
+      if (registeredSourceId) {
+        void invoke("release_outgoing_file", { sourceId: registeredSourceId }).catch(() => undefined);
+      }
       const detail = cause instanceof Error ? cause.message : String(cause);
-      setTransferStatus(`无法准备文件续传：${detail}`);
+      setTransferStatus(`无法准备文件发送：${detail}`);
     }
   }
 
-  async function transmitFile(socket: WebSocket, transferId: string, file: File, resumeOffset: number) {
+  async function transmitFile(socket: WebSocket, transferId: string, resumeOffset: number) {
+    const initial = pendingFileSendsRef.current.get(transferId);
+    if (!initial) return;
+    const { sourceId, fileName, size } = initial;
     let offset = resumeOffset;
-    let loggedProgressBucket = Math.floor(resumeOffset / (5 * 1024 * 1024));
+    let loggedProgressBucket = Math.floor(resumeOffset / FILE_PROGRESS_LOG_STEP);
+    let lastUiUpdate = 0;
     try {
-      const chunkSize = 48 * 1024;
-      while (offset < file.size) {
+      while (offset < size) {
         const session = pendingFileSendsRef.current.get(transferId);
-        if (!session) throw new Error("文件传输已取消。");
+        if (!session) throw new Error(FILE_TRANSFER_CANCELLED);
         while (session.paused && !session.cancelled) {
-          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          await sleep(100);
         }
-        if (session.cancelled) throw new Error("文件传输已取消。");
-        while (socket.bufferedAmount > 512 * 1024) {
-          if (session.cancelled) throw new Error("文件传输已取消。");
-          while (session.paused && !session.cancelled) {
-            await new Promise((resolve) => window.setTimeout(resolve, 100));
-          }
+        if (session.cancelled) throw new Error(FILE_TRANSFER_CANCELLED);
+        while (socket.bufferedAmount > FILE_SEND_BUFFER_HIGH_WATER) {
+          if (session.cancelled) throw new Error(FILE_TRANSFER_CANCELLED);
           if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
-          await new Promise((resolve) => window.setTimeout(resolve, 30));
+          await sleep(5);
         }
-        const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+        // Rust 按偏移读取 1 MiB 原始数据块，以 ArrayBuffer 返回，不经过 JSON 序列化。
+        const chunk = await invoke<ArrayBuffer>("read_outgoing_file_chunk", { sourceId, offset });
+        if (chunk.byteLength === 0) throw new Error("读取文件数据失败。");
         while (session.paused && !session.cancelled) {
-          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          await sleep(100);
         }
-        if (session.cancelled) throw new Error("文件传输已取消。");
+        if (session.cancelled) throw new Error(FILE_TRANSFER_CANCELLED);
         if (socket.readyState !== WebSocket.OPEN) throw new Error("连接已关闭。");
         socket.send(chunk);
         offset += chunk.byteLength;
-        const progressBucket = Math.floor(offset / (5 * 1024 * 1024));
+        const progressBucket = Math.floor(offset / FILE_PROGRESS_LOG_STEP);
         if (progressBucket > loggedProgressBucket) {
           loggedProgressBucket = progressBucket;
-          recordDiagnosticEvent("file_transfer_progress", offset, file.size);
+          recordDiagnosticEvent("file_transfer_progress", offset, size);
         }
-        const active = activeFileTransferRef.current;
-        if (active?.transferId === transferId) {
-          updateActiveFileTransfer({ ...active, transferred: offset });
+        const now = performance.now();
+        if (now - lastUiUpdate >= FILE_PROGRESS_UI_INTERVAL_MS || offset >= size) {
+          lastUiUpdate = now;
+          const active = activeFileTransferRef.current;
+          if (active?.transferId === transferId) {
+            updateActiveFileTransfer({ ...active, transferred: offset });
+          }
+          setTransferStatus(`正在发送 ${fileName}：${formatFileSize(offset)} / ${formatFileSize(size)}`);
         }
-        setTransferStatus(`正在发送 ${file.name}：${offset} / ${file.size} 字节`);
       }
       socket.send(JSON.stringify({ type: "file_complete", transfer_id: transferId }));
-      setTransferStatus(`数据已发送，正在校验并保存 ${file.name}…`);
+      setTransferStatus(`数据已发送，对端正在校验并保存 ${fileName}…`);
     } catch (cause) {
-      pendingFileSendsRef.current.delete(transferId);
+      // 会话已被取消或断线流程移除时，对应的状态提示已由那一侧写好，这里不再覆盖。
+      if (!pendingFileSendsRef.current.has(transferId)) {
+        if (activeFileTransferRef.current?.transferId === transferId) updateActiveFileTransfer(null);
+        return;
+      }
+      forgetFileSend(transferId);
       const detail = cause instanceof Error ? cause.message : String(cause);
-      if (detail === "文件传输已取消。") {
+      if (detail === FILE_TRANSFER_CANCELLED) {
         updateActiveFileTransfer(null);
-        setTransferStatus(`已取消 ${file.name}。`);
+        setTransferStatus(`已取消 ${fileName}。`);
         return;
       }
       updateActiveFileTransfer(null);
@@ -2524,98 +2612,51 @@ function App() {
     }
   }
 
-  async function selectAgentFile(file: File | undefined) {
-    if (!file || !agentConnected) return;
-    if (file.size === 0 || file.size > 100 * 1024 * 1024) {
-      setAgentClipboardStatus("文件必须大于 0 且不超过 100 MiB。");
-      return;
-    }
+  async function selectAgentFile() {
+    if (!agentConnected) return;
     if (pendingAgentFileRef.current) {
       setAgentClipboardStatus("已有文件正在等待发送或传输，请完成后再试。");
       return;
     }
     try {
-      setAgentClipboardStatus(`正在校验 ${file.name}，请稍候…`);
-      const sha256 = await hashFile(file);
+      const prepared = await pickOutgoingFile(setAgentClipboardStatus);
+      if (!prepared) return;
+      const releasePrepared = () =>
+        void invoke("release_outgoing_file", { sourceId: prepared.sourceId }).catch(() => undefined);
+      if (prepared.size === 0 || prepared.size > MAX_FILE_TRANSFER_SIZE) {
+        setAgentClipboardStatus("文件必须大于 0 且不超过 10 GiB。");
+        releasePrepared();
+        return;
+      }
+      if (pendingAgentFileRef.current) {
+        setAgentClipboardStatus("已有文件正在等待发送或传输，请完成后再试。");
+        releasePrepared();
+        return;
+      }
       const targetIdentity = agentPeerIdentityRef.current || "unknown-controller";
-      const transferId = await getOrCreateFileTransferId(file.name, sha256, targetIdentity);
-      if (!agentConnected) throw new Error("校验完成时被控端连接已断开。");
-      pendingAgentFileRef.current = { transferId, file, sha256, paused: false, cancelled: false };
-      recordDiagnosticEvent("file_transfer_started", file.size);
+      const transferId = await getOrCreateFileTransferId(prepared.fileName, prepared.sha256, targetIdentity);
+      pendingAgentFileRef.current = { ...prepared, transferId, paused: false, cancelled: false };
+      recordDiagnosticEvent("file_transfer_started", prepared.size);
       updateActiveFileTransfer({
         transferId,
-        fileName: file.name,
-        size: file.size,
+        fileName: prepared.fileName,
+        size: prepared.size,
         transferred: 0,
         paused: false,
         path: "tauri",
         mode: "send",
       });
+      // 被控端的文件读取、发送、流控、暂停/续传全部在 Rust 中完成。
       await invoke("begin_agent_file_transfer", {
         transferId,
-        fileName: file.name,
-        size: file.size,
-        sha256,
+        sourceId: prepared.sourceId,
       });
-      setAgentClipboardStatus(`已请求发送 ${file.name}，等待控制端批准。`);
+      setAgentClipboardStatus(`已请求发送 ${prepared.fileName}，等待控制端批准。`);
     } catch (cause) {
       pendingAgentFileRef.current = null;
       updateActiveFileTransfer(null);
       const detail = cause instanceof Error ? cause.message : String(cause);
       setAgentClipboardStatus(`无法发送文件：${detail}`);
-    }
-  }
-
-  async function transmitAgentFile(transferId: string, file: File, resumeOffset: number) {
-    let offset = resumeOffset;
-    let loggedProgressBucket = Math.floor(resumeOffset / (5 * 1024 * 1024));
-    let awaitingCompletion = false;
-    try {
-      const chunkSize = 48 * 1024;
-      while (offset < file.size) {
-        const session = pendingAgentFileRef.current;
-        if (!session || session.transferId !== transferId) throw new Error("文件传输已取消。");
-        while (session.paused && !session.cancelled) {
-          await new Promise((resolve) => window.setTimeout(resolve, 100));
-        }
-        if (session.cancelled) throw new Error("文件传输已取消。");
-        const chunk = new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer());
-        while (session.paused && !session.cancelled) {
-          await new Promise((resolve) => window.setTimeout(resolve, 100));
-        }
-        if (session.cancelled) throw new Error("文件传输已取消。");
-        await invoke("send_agent_file_chunk", {
-          transferId,
-          bytes: Array.from(chunk),
-        });
-        offset += chunk.byteLength;
-        const progressBucket = Math.floor(offset / (5 * 1024 * 1024));
-        if (progressBucket > loggedProgressBucket) {
-          loggedProgressBucket = progressBucket;
-          recordDiagnosticEvent("file_transfer_progress", offset, file.size);
-        }
-        const active = activeFileTransferRef.current;
-        if (active?.transferId === transferId) {
-          updateActiveFileTransfer({ ...active, transferred: offset });
-        }
-        setAgentClipboardStatus(`正在发送 ${file.name}：${offset} / ${file.size} 字节`);
-      }
-      await invoke("finish_agent_file_transfer", { transferId });
-      awaitingCompletion = true;
-      setAgentClipboardStatus(`数据已发送，正在校验并保存 ${file.name}…`);
-    } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause);
-      if (detail === "文件传输已取消。") {
-        setAgentClipboardStatus(`已取消 ${file.name}。`);
-      } else {
-        recordDiagnosticEvent("file_transfer_failed");
-        setAgentClipboardStatus(`文件发送失败：${detail}。续传标识已保留；连接恢复后再次选择同一文件可继续。`);
-      }
-    } finally {
-      if (!awaitingCompletion) {
-        pendingAgentFileRef.current = null;
-        updateActiveFileTransfer(null);
-      }
     }
   }
 
@@ -2717,7 +2758,7 @@ function App() {
               ? pendingAgentFileRef.current
               : null;
           if (sendingSession) clearFileTransferIdentity(active.transferId);
-          pendingFileSendsRef.current.delete(active.transferId);
+          forgetFileSend(active.transferId);
           if (pendingAgentFileRef.current?.transferId === active.transferId) {
             pendingAgentFileRef.current = null;
           }
@@ -3015,18 +3056,9 @@ function App() {
                   <button className="text-button agent-clipboard-button" onClick={() => void sendAgentClipboard()} type="button">
                     发送本机剪贴板
                   </button>
-                  <button className="text-button agent-clipboard-button" onClick={() => agentFileInputRef.current?.click()} type="button">
+                  <button className="text-button agent-clipboard-button" onClick={() => void selectAgentFile()} type="button">
                     发送文件到控制端
                   </button>
-                  <input
-                    ref={agentFileInputRef}
-                    className="visually-hidden"
-                    type="file"
-                    onChange={(event) => {
-                      void selectAgentFile(event.currentTarget.files?.[0]);
-                      event.currentTarget.value = "";
-                    }}
-                  />
                 </>
               )}
             </div>
@@ -3039,7 +3071,7 @@ function App() {
                 <span>
                   {activeFileTransfer.paused ? "已暂停" : activeFileTransfer.mode === "send" ? "正在发送" : "正在接收"}
                   {" · "}
-                  {activeFileTransfer.transferred.toLocaleString()} / {activeFileTransfer.size.toLocaleString()} 字节
+                  {formatFileSize(activeFileTransfer.transferred)} / {formatFileSize(activeFileTransfer.size)}
                 </span>
                 <progress value={activeFileTransfer.transferred} max={activeFileTransfer.size} />
               </div>
@@ -3242,7 +3274,7 @@ function App() {
                             event.preventDefault();
                             event.stopPropagation();
                           }}
-                          onClick={() => fileInputRef.current?.click()}
+                          onClick={() => void selectFile().finally(restoreRemoteFocus)}
                         >
                           <Icon name="file" />
                         </button>
@@ -3298,15 +3330,6 @@ function App() {
                       )}
                     </button>
                   )}
-                  <input
-                    ref={fileInputRef}
-                    className="visually-hidden"
-                    type="file"
-                    onChange={(event) => {
-                      void selectFile(event.currentTarget.files?.[0]).finally(restoreRemoteFocus);
-                      event.currentTarget.value = "";
-                    }}
-                  />
                   {transferStatus && <div className="transfer-status" role="status">{transferStatus}</div>}
                   <div className="device-card-footer">
                     <span className="device-card-icon"><Icon name="desktop" /></span>
@@ -3840,7 +3863,7 @@ function App() {
             <span className="dialog-icon"><Icon name="file" /></span>
             <h2 id="file-offer-title">接收文件？</h2>
             <p>
-              对端请求发送 <strong>{pendingFileOffer.fileName}</strong>（{(pendingFileOffer.size / 1024 / 1024).toFixed(2)} MiB）。
+              对端请求发送 <strong>{pendingFileOffer.fileName}</strong>（{formatFileSize(pendingFileOffer.size)}）。
               {pendingFileOffer.receivedBytes > 0
                 ? ` 已接收 ${pendingFileOffer.receivedBytes.toLocaleString()} 字节，接受后将从断点继续。`
                 : ""}

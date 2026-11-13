@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use arboard::Clipboard;
@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tauri::{AppHandle, Emitter};
+use tauri_plugin_dialog::DialogExt;
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -47,9 +48,26 @@ const DEFAULT_PORT: u16 = 4200;
 const DISCOVERY_PORT: u16 = 42011;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 const SIGNALING_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_FILE_TRANSFER_SIZE: u64 = 100 * 1024 * 1024;
+const MAX_FILE_TRANSFER_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_CLIPBOARD_TEXT_SIZE: usize = 48 * 1024;
-const MAX_FILE_CHUNK_SIZE: usize = 48 * 1024;
+const MAX_FILE_CHUNK_SIZE: usize = 1024 * 1024;
+// WebSocket 单条消息上限：需容纳 1 MiB 文件数据块。
+const MAX_SIGNAL_MESSAGE_SIZE: usize = 2 * 1024 * 1024;
+// 被控端发送文件时允许未被控制端确认落盘的最大字节数，用于限制控制端内存占用。
+const FILE_SEND_WINDOW: u64 = 16 * 1024 * 1024;
+const FILE_PROGRESS_EVENT_STEP: u64 = 4 * 1024 * 1024;
+const FILE_PROGRESS_LOG_STEP: u64 = 64 * 1024 * 1024;
+const FILE_HASH_PROGRESS_STEP: u64 = 64 * 1024 * 1024;
+const MAX_PREPARED_OUTGOING_FILES: usize = 16;
+// 每接收这么多数据做一次 fsync 并记录「已确认落盘」位置；崩溃后只回退到最近的检查点。
+const PARTIAL_SYNC_CHECKPOINT: u64 = 64 * 1024 * 1024;
+// 旧版续传记录没有检查点信息时，续传前保守回退的长度。
+const LEGACY_RESUME_ROLLBACK: u64 = 8 * 1024 * 1024;
+// 接受文件前额外预留的磁盘空间。
+const DISK_SPACE_MARGIN: u64 = 256 * 1024 * 1024;
+// 分段哈希的段大小：最终校验失败时，只回退到第一个损坏段的开头续传。
+const FILE_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_FILE_HASH_CACHE_ENTRIES: usize = 64;
 const MAX_DIAGNOSTIC_LOG_SIZE: u64 = 512 * 1024;
 const PARTIAL_TRANSFER_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 static DIAGNOSTIC_LOG_LOCK: Mutex<()> = Mutex::new(());
@@ -331,6 +349,16 @@ fn is_valid_file_offer(transfer_id: &str, file_name: &str, size: u64, sha256: &s
             .all(|character| character.is_ascii_hexdigit())
 }
 
+/// 分段哈希列表允许为空（兼容旧版发送端，此时校验失败只能整体重传）；
+/// 非空时段数必须与文件大小一致，每段都是 64 位十六进制 SHA-256。
+fn is_valid_segment_hashes(size: u64, segment_hashes: &[String]) -> bool {
+    segment_hashes.is_empty()
+        || (segment_hashes.len() as u64 == size.div_ceil(FILE_SEGMENT_SIZE)
+            && segment_hashes.iter().all(|hash| {
+                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+            }))
+}
+
 fn is_valid_transfer_id(transfer_id: &str) -> bool {
     !transfer_id.is_empty()
         && transfer_id.len() <= 64
@@ -589,16 +617,105 @@ pub fn set_system_clipboard_text(
     Ok(())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedOutgoingFile {
+    source_id: String,
+    file_name: String,
+    size: u64,
+    sha256: String,
+    segment_hashes: Vec<String>,
+}
+
+/// 选择要发送的文件：在 Rust 侧弹出系统文件选择框、流式计算 SHA-256，
+/// 并登记为可发送的文件源。前端只拿到 sourceId 和文件元信息，不再读取文件内容。
+#[tauri::command]
+pub async fn prepare_outgoing_file(
+    app: AppHandle,
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    on_progress: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<Option<PreparedOutgoingFile>, String> {
+    let (sender, receiver) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("选择要发送的文件")
+        .pick_file(move |path| {
+            let _ = sender.send(path);
+        });
+    let Some(path) = receiver
+        .await
+        .map_err(|_| "文件选择窗口已关闭。".to_string())?
+    else {
+        return Ok(None);
+    };
+    let path = path
+        .into_path()
+        .map_err(|error| format!("无法读取所选文件路径：{error}"))?;
+    let state = Arc::clone(remote.inner());
+    let source = tokio::task::spawn_blocking(move || {
+        prepare_outgoing_file_source(&state, path, &on_progress)
+    })
+    .await
+    .map_err(|error| format!("文件校验任务失败：{error}"))??;
+    let source_id = Uuid::new_v4().to_string();
+    let prepared = PreparedOutgoingFile {
+        source_id: source_id.clone(),
+        file_name: source.file_name.clone(),
+        size: source.size,
+        sha256: source.sha256.clone(),
+        segment_hashes: source.segment_hashes.clone(),
+    };
+    let mut files = remote
+        .outgoing_files
+        .lock()
+        .map_err(|_| "文件发送状态不可用".to_string())?;
+    if files.len() >= MAX_PREPARED_OUTGOING_FILES {
+        files.remove(0);
+    }
+    files.push((source_id, Arc::new(source)));
+    Ok(Some(prepared))
+}
+
+/// 控制端发送文件时按偏移读取一个数据块，以原始二进制返回给前端（不经过 JSON 数组序列化）。
+#[tauri::command]
+pub async fn read_outgoing_file_chunk(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    source_id: String,
+    offset: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let source = prepared_outgoing_file(remote.inner(), &source_id)?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let mut file = open_outgoing_file_source(&source, offset)?;
+        read_outgoing_chunk(&mut file, &source, offset)
+    })
+    .await
+    .map_err(|error| format!("读取文件任务失败：{error}"))??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub fn release_outgoing_file(
+    remote: tauri::State<'_, Arc<RemoteState>>,
+    source_id: String,
+) -> Result<(), String> {
+    remote
+        .outgoing_files
+        .lock()
+        .map_err(|_| "文件发送状态不可用".to_string())?
+        .retain(|(id, _)| id.as_str() != source_id.as_str());
+    Ok(())
+}
+
 #[tauri::command]
 pub fn begin_agent_file_transfer(
     remote: tauri::State<'_, Arc<RemoteState>>,
     transfer_id: String,
-    file_name: String,
-    size: u64,
-    sha256: String,
+    source_id: String,
 ) -> Result<(), String> {
-    if !is_valid_file_offer(&transfer_id, &file_name, size, &sha256) {
-        return Err("文件名或大小无效，文件不能超过 100 MiB。".to_string());
+    // 被控端发送时文件由 Rust 传输任务持有，这里直接从登记表中取走，传完自动释放。
+    let source = take_prepared_outgoing_file(remote.inner(), &source_id)?;
+    if !is_valid_file_offer(&transfer_id, &source.file_name, source.size, &source.sha256) {
+        return Err("文件名或大小无效，文件不能超过 10 GiB。".to_string());
     }
     let sender = remote
         .file_sender
@@ -608,57 +725,11 @@ pub fn begin_agent_file_transfer(
         .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
     sender
         .send(AgentFileCommand::Offer {
-            transfer_id: transfer_id.clone(),
-            file_name,
-            size,
-            sha256,
+            transfer_id,
+            source,
         })
         .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())?;
     Ok(())
-}
-
-#[tauri::command]
-pub async fn send_agent_file_chunk(
-    remote: tauri::State<'_, Arc<RemoteState>>,
-    transfer_id: String,
-    bytes: Vec<u8>,
-) -> Result<(), String> {
-    if transfer_id.len() > 64 || bytes.is_empty() || bytes.len() > MAX_FILE_CHUNK_SIZE {
-        return Err("文件数据块无效。".to_string());
-    }
-    let sender = remote
-        .file_sender
-        .lock()
-        .map_err(|_| "文件传输状态不可用".to_string())?
-        .clone()
-        .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
-    let (acknowledged, response) = oneshot::channel();
-    sender
-        .send(AgentFileCommand::Chunk {
-            transfer_id,
-            bytes,
-            acknowledged,
-        })
-        .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())?;
-    response
-        .await
-        .map_err(|_| "文件传输通道在确认数据块前已关闭。".to_string())?
-}
-
-#[tauri::command]
-pub fn finish_agent_file_transfer(
-    remote: tauri::State<'_, Arc<RemoteState>>,
-    transfer_id: String,
-) -> Result<(), String> {
-    let sender = remote
-        .file_sender
-        .lock()
-        .map_err(|_| "文件传输状态不可用".to_string())?
-        .clone()
-        .ok_or_else(|| "当前没有可用的控制连接。".to_string())?;
-    sender
-        .send(AgentFileCommand::Complete { transfer_id })
-        .map_err(|_| "文件传输通道已关闭，请重新连接后重试。".to_string())
 }
 
 #[tauri::command]
@@ -695,9 +766,12 @@ pub fn begin_controller_file_receive(
     file_name: String,
     size: u64,
     sha256: String,
+    segment_hashes: Vec<String>,
 ) -> Result<u64, String> {
-    if !is_valid_file_offer(&transfer_id, &file_name, size, &sha256) {
-        return Err("文件接收请求无效或超过 100 MiB 限制".to_string());
+    if !is_valid_file_offer(&transfer_id, &file_name, size, &sha256)
+        || !is_valid_segment_hashes(size, &segment_hashes)
+    {
+        return Err("文件接收请求无效或超过 10 GiB 限制".to_string());
     }
     let mut pending = remote
         .controller_file_receiver
@@ -706,18 +780,28 @@ pub fn begin_controller_file_receive(
     if pending.is_some() {
         return Err("已有文件正在接收。".to_string());
     }
-    let receiver = open_partial_file_receiver(&app, transfer_id, file_name, size, sha256)?;
+    let receiver =
+        open_partial_file_receiver(&app, transfer_id, file_name, size, sha256, segment_hashes)?;
     let offset = receiver.received_size;
     *pending = Some(receiver);
     Ok(offset)
 }
 
-#[tauri::command]
+/// 控制端接收文件数据块。前端以原始二进制请求体调用（Uint8Array），
+/// 传输标识放在 `x-transfer-id` 请求头里；返回已落盘的总字节数，用于向被控端确认进度。
+#[tauri::command(async)]
 pub fn append_controller_file_chunk(
     remote: tauri::State<'_, Arc<RemoteState>>,
-    transfer_id: String,
-    bytes: Vec<u8>,
-) -> Result<(), String> {
+    request: tauri::ipc::Request<'_>,
+) -> Result<u64, String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("文件数据块格式无效。".to_string());
+    };
+    let transfer_id = request
+        .headers()
+        .get("x-transfer-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "文件数据块缺少传输标识。".to_string())?;
     if bytes.is_empty() || bytes.len() > MAX_FILE_CHUNK_SIZE {
         return Err("文件数据块无效。".to_string());
     }
@@ -729,29 +813,35 @@ pub fn append_controller_file_chunk(
         .as_mut()
         .filter(|receiver| receiver.metadata.transfer_id == transfer_id)
         .ok_or_else(|| "文件接收请求已过期。".to_string())?;
-    append_partial_file_chunk(receiver, &bytes)
+    append_partial_file_chunk(receiver, bytes)?;
+    Ok(receiver.received_size)
 }
 
+/// 校验 SHA-256 并保存文件。大文件校验耗时较长，放到阻塞线程池执行，避免卡住界面主线程。
 #[tauri::command]
-pub fn finish_controller_file_receive(
+pub async fn finish_controller_file_receive(
     app: AppHandle,
     remote: tauri::State<'_, Arc<RemoteState>>,
     transfer_id: String,
 ) -> Result<String, String> {
-    let mut pending = remote
-        .controller_file_receiver
-        .lock()
-        .map_err(|_| "文件接收状态不可用".to_string())?;
-    if !pending
-        .as_ref()
-        .is_some_and(|receiver| receiver.metadata.transfer_id == transfer_id)
-    {
-        return Err("文件接收请求已过期。".to_string());
-    }
-    let receiver = pending
-        .take()
-        .ok_or_else(|| "文件接收请求已过期。".to_string())?;
-    finish_partial_file_receive(&app, receiver)
+    let receiver = {
+        let mut pending = remote
+            .controller_file_receiver
+            .lock()
+            .map_err(|_| "文件接收状态不可用".to_string())?;
+        if !pending
+            .as_ref()
+            .is_some_and(|receiver| receiver.metadata.transfer_id == transfer_id)
+        {
+            return Err("文件接收请求已过期。".to_string());
+        }
+        pending
+            .take()
+            .ok_or_else(|| "文件接收请求已过期。".to_string())?
+    };
+    tokio::task::spawn_blocking(move || finish_partial_file_receive(&app, receiver))
+        .await
+        .map_err(|error| format!("文件保存任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -837,6 +927,8 @@ pub struct RemoteState {
     clipboard_sync_enabled: AtomicBool,
     system_audio_sync_enabled: AtomicBool,
     controller_file_receiver: Mutex<Option<ControllerFileReceiver>>,
+    outgoing_files: Mutex<Vec<(String, Arc<OutgoingFileSource>)>>,
+    file_hash_cache: Mutex<Vec<CachedFileDigest>>,
     capture_display_id: Mutex<Option<u32>>,
     webrtc_factory: Mutex<Option<Arc<PeerConnectionFactory>>>,
     active_connection: AtomicBool,
@@ -846,17 +938,7 @@ pub struct RemoteState {
 enum AgentFileCommand {
     Offer {
         transfer_id: String,
-        file_name: String,
-        size: u64,
-        sha256: String,
-    },
-    Chunk {
-        transfer_id: String,
-        bytes: Vec<u8>,
-        acknowledged: oneshot::Sender<Result<(), String>>,
-    },
-    Complete {
-        transfer_id: String,
+        source: Arc<OutgoingFileSource>,
     },
     Control {
         transfer_id: String,
@@ -871,6 +953,12 @@ struct PartialTransferMetadata {
     expected_size: u64,
     sha256: String,
     updated_at: u64,
+    /// 已 fsync 确认落盘的字节数。续传时只信任这个位置之前的数据。
+    #[serde(default)]
+    synced_size: Option<u64>,
+    /// 发送端提供的每 64 MiB 分段 SHA-256，用于定位损坏段。旧记录为空。
+    #[serde(default)]
+    segment_hashes: Vec<String>,
 }
 
 struct ControllerFileReceiver {
@@ -879,6 +967,105 @@ struct ControllerFileReceiver {
     partial_path: PathBuf,
     metadata_path: PathBuf,
     received_size: u64,
+}
+
+impl Drop for ControllerFileReceiver {
+    /// 正常挂起（断线、暂停超时、切换传输）时把当前进度落盘并记为检查点，
+    /// 这样正常中断不会损失进度；只有进程崩溃/断电才回退到上一个检查点。
+    /// 完成或丢弃时 file 已被取走，不会再写记录。
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take()
+            && file.sync_data().is_ok()
+        {
+            self.metadata.synced_size = Some(self.received_size);
+            if let Ok(now) = unix_timestamp() {
+                self.metadata.updated_at = now;
+            }
+            let _ = write_partial_metadata(&self.metadata_path, &self.metadata);
+        }
+    }
+}
+
+struct OutgoingFileSource {
+    path: PathBuf,
+    file_name: String,
+    size: u64,
+    modified: Option<SystemTime>,
+    sha256: String,
+    segment_hashes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct FileDigest {
+    sha256: String,
+    segment_hashes: Vec<String>,
+}
+
+struct CachedFileDigest {
+    path: PathBuf,
+    size: u64,
+    modified: Option<SystemTime>,
+    digest: FileDigest,
+}
+
+/// 被控端正在发送给控制端的文件。数据由 Rust 直接从磁盘读取并写入 WebSocket，
+/// 通过控制端的 file_ack 做滑动窗口流控。
+struct AgentOutgoingFileTransfer {
+    transfer_id: String,
+    source: Arc<OutgoingFileSource>,
+    file: Option<File>,
+    sent: u64,
+    acknowledged: u64,
+    accepted: bool,
+    paused: bool,
+    completion_sent: bool,
+    last_progress_event: u64,
+}
+
+impl AgentOutgoingFileTransfer {
+    fn new(transfer_id: String, source: Arc<OutgoingFileSource>) -> Self {
+        Self {
+            transfer_id,
+            source,
+            file: None,
+            sent: 0,
+            acknowledged: 0,
+            accepted: false,
+            paused: false,
+            completion_sent: false,
+            last_progress_event: 0,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        self.source.size
+    }
+
+    fn can_send(&self) -> bool {
+        self.accepted
+            && !self.paused
+            && self.file.is_some()
+            && self.sent < self.size()
+            && self.sent.saturating_sub(self.acknowledged) < FILE_SEND_WINDOW
+    }
+
+    fn start(&mut self, resume_offset: u64) -> Result<(), String> {
+        self.file = Some(open_outgoing_file_source(&self.source, resume_offset)?);
+        self.sent = resume_offset;
+        self.acknowledged = resume_offset;
+        self.last_progress_event = resume_offset;
+        self.accepted = true;
+        self.paused = false;
+        Ok(())
+    }
+
+    fn read_next_chunk(&mut self) -> Result<Vec<u8>, String> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| "文件发送句柄不可用。".to_string())?;
+        read_outgoing_chunk(file, &self.source, self.sent)
+    }
 }
 
 struct AgentIncomingFileTransfer {
@@ -1014,6 +1201,8 @@ enum ClientMessage {
         file_name: String,
         size: u64,
         sha256: String,
+        #[serde(default)]
+        segment_hashes: Vec<String>,
     },
     FileComplete {
         transfer_id: String,
@@ -1023,6 +1212,10 @@ enum ClientMessage {
         accepted: bool,
         #[serde(default)]
         resume_offset: u64,
+    },
+    FileAck {
+        transfer_id: String,
+        received: u64,
     },
     QualityAdjust {
         level: AdaptiveQuality,
@@ -1558,8 +1751,8 @@ async fn websocket_upgrade(
     if !is_lan_address(peer.ip()) {
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    ws.max_message_size(512 * 1024)
-        .max_frame_size(512 * 1024)
+    ws.max_message_size(MAX_SIGNAL_MESSAGE_SIZE)
+        .max_frame_size(MAX_SIGNAL_MESSAGE_SIZE)
         .on_upgrade(move |socket| handle_connection(socket, peer, state))
         .into_response()
 }
@@ -2362,7 +2555,9 @@ async fn run_webrtc_session(
         .lock()
         .map_err(|_| "文件传输状态不可用".to_string())? = Some(file_sender);
     let _file_sender_guard = AgentFileSenderGuard(Arc::clone(&state.remote));
-    let mut agent_file_transfer: Option<(String, u64, u64, bool)> = None;
+    let mut agent_file_transfer: Option<AgentOutgoingFileTransfer> = None;
+    let mut agent_file_finish: Option<(String, String, u64, JoinHandle<Result<String, String>>)> =
+        None;
     let mut agent_incoming_file_transfer: Option<AgentIncomingFileTransfer> = None;
     let mut file_approval_receiver: Option<oneshot::Receiver<bool>> = None;
     let mut file_approval_deadline = None;
@@ -2434,6 +2629,7 @@ async fn run_webrtc_session(
                                 file_name,
                                 size,
                                 sha256,
+                                segment_hashes,
                             }) => {
                                 let _ = append_diagnostic_log_values(
                                     &state.app,
@@ -2446,10 +2642,11 @@ async fn run_webrtc_session(
                                     &file_name,
                                     size,
                                     &sha256,
-                                );
+                                ) && is_valid_segment_hashes(size, &segment_hashes);
                                 if !valid_offer
                                     || agent_file_transfer.is_some()
                                     || agent_incoming_file_transfer.is_some()
+                                    || agent_file_finish.is_some()
                                 {
                                     send_signal(
                                         socket,
@@ -2468,6 +2665,7 @@ async fn run_webrtc_session(
                                         file_name.clone(),
                                         size,
                                         sha256,
+                                        segment_hashes,
                                     ) {
                                         Ok(receiver) => receiver,
                                         Err(error) => {
@@ -2557,54 +2755,17 @@ async fn run_webrtc_session(
                                 let transfer_id = incoming.receiver.metadata.transfer_id.clone();
                                 let file_name = incoming.receiver.metadata.file_name.clone();
                                 let received_size = incoming.receiver.metadata.expected_size;
-                                let saved_path = match finish_partial_file_receive(
-                                    &state.app,
-                                    incoming.receiver,
-                                ) {
-                                    Ok(path) => path,
-                                    Err(error) => {
-                                        let _ = append_diagnostic_log(
-                                            &state.app,
-                                            DiagnosticEvent::FileTransferFailed,
-                                        );
-                                        send_signal(socket, serde_json::json!({
-                                            "type": "file_transfer_error",
-                                            "transfer_id": transfer_id,
-                                            "message": error,
-                                        }))
-                                        .await
-                                        .map_err(|error| format!("发送文件错误状态失败：{error}"))?;
-                                        continue;
-                                    }
-                                };
-                                let _ = append_diagnostic_log(
-                                    &state.app,
-                                    DiagnosticEvent::FileTransferCompleted,
-                                );
-                                send_signal(
-                                    socket,
-                                    serde_json::json!({
-                                        "type": "file_transfer_complete",
-                                        "transfer_id": transfer_id.clone(),
+                                let app = state.app.clone();
+                                let receiver = incoming.receiver;
+                                // SHA-256 校验和保存放到阻塞线程池，期间信令循环继续处理键鼠和 WebRTC 消息。
+                                agent_file_finish = Some((
+                                    transfer_id,
+                                    file_name,
+                                    received_size,
+                                    tokio::task::spawn_blocking(move || {
+                                        finish_partial_file_receive(&app, receiver)
                                     }),
-                                )
-                                .await
-                                .map_err(|error| format!("发送文件完成状态失败：{error}"))?;
-                                state
-                                    .app
-                                    .emit(
-                                        "remote-file-received",
-                                        serde_json::json!({
-                                            "transferId": transfer_id,
-                                            "fileName": file_name,
-                                            "savedPath": saved_path,
-                                            "controllerName": controller_name,
-                                            "receivedBytes": received_size,
-                                        }),
-                                    )
-                                    .map_err(|error| {
-                                        format!("无法显示文件保存状态：{error}")
-                                    })?;
+                                ));
                             }
                             Ok(ClientMessage::FileTransferDecision {
                                 transfer_id,
@@ -2612,13 +2773,16 @@ async fn run_webrtc_session(
                                 resume_offset,
                             }) => {
                                 match agent_file_transfer.as_mut() {
-                                    Some((active_id, size, sent, is_accepted)) if *active_id == transfer_id => {
-                                        if accepted && resume_offset <= *size {
-                                            *sent = resume_offset;
-                                        } else if accepted {
+                                    Some(transfer) if transfer.transfer_id == transfer_id => {
+                                        let size = transfer.size();
+                                        if accepted && resume_offset > size {
                                             return Err("续传进度超过文件长度".to_string());
                                         }
-                                        *is_accepted = accepted;
+                                        let start_error = if accepted {
+                                            transfer.start(resume_offset).err()
+                                        } else {
+                                            None
+                                        };
                                         let _ = append_diagnostic_log_values(
                                             &state.app,
                                             if accepted {
@@ -2627,8 +2791,31 @@ async fn run_webrtc_session(
                                                 DiagnosticEvent::FileTransferRejected
                                             },
                                             Some(resume_offset),
-                                            Some(*size),
+                                            Some(size),
                                         );
+                                        if let Some(error) = start_error {
+                                            agent_file_transfer = None;
+                                            let _ = append_diagnostic_log(
+                                                &state.app,
+                                                DiagnosticEvent::FileTransferFailed,
+                                            );
+                                            let _ = state.app.emit(
+                                                "agent-file-transfer-decision",
+                                                serde_json::json!({
+                                                    "transferId": transfer_id,
+                                                    "accepted": false,
+                                                    "error": error,
+                                                }),
+                                            );
+                                            send_signal(socket, serde_json::json!({
+                                                "type": "file_transfer_error",
+                                                "transfer_id": transfer_id,
+                                                "message": error,
+                                            }))
+                                            .await
+                                            .map_err(|error| format!("发送文件传输错误失败：{error}"))?;
+                                            continue;
+                                        }
                                         state.app.emit(
                                             "agent-file-transfer-decision",
                                             serde_json::json!({
@@ -2702,7 +2889,7 @@ async fn run_webrtc_session(
                                     );
                                 } else if agent_file_transfer
                                     .as_ref()
-                                    .is_some_and(|(active_id, _, _, _)| active_id == &transfer_id)
+                                    .is_some_and(|transfer| transfer.transfer_id == transfer_id)
                                 {
                                     let control_event = match action.as_str() {
                                         "pause" => DiagnosticEvent::FileTransferPaused,
@@ -2723,6 +2910,8 @@ async fn run_webrtc_session(
                                     );
                                     if action == "cancel" {
                                         agent_file_transfer = None;
+                                    } else if let Some(transfer) = agent_file_transfer.as_mut() {
+                                        transfer.paused = action == "pause";
                                     }
                                 } else {
                                     send_signal(socket, serde_json::json!({
@@ -2735,14 +2924,14 @@ async fn run_webrtc_session(
                                 }
                             }
                             Ok(ClientMessage::FileTransferComplete { transfer_id }) => {
-                                if agent_file_transfer.as_ref().is_some_and(
-                                    |(active_id, size, sent, accepted)| {
-                                        active_id == &transfer_id && *accepted && size == sent
-                                    },
-                                ) {
+                                if agent_file_transfer.as_ref().is_some_and(|transfer| {
+                                    transfer.transfer_id == transfer_id
+                                        && transfer.accepted
+                                        && transfer.sent == transfer.size()
+                                }) {
                                     let completed_size = agent_file_transfer
                                         .as_ref()
-                                        .map(|(_, size, _, _)| *size)
+                                        .map(AgentOutgoingFileTransfer::size)
                                         .unwrap_or_default();
                                     let _ = state.app.emit(
                                         "agent-file-transfer-complete",
@@ -2763,10 +2952,19 @@ async fn run_webrtc_session(
                                     );
                                 }
                             }
+                            Ok(ClientMessage::FileAck { transfer_id, received }) => {
+                                if let Some(transfer) = agent_file_transfer
+                                    .as_mut()
+                                    .filter(|transfer| transfer.transfer_id == transfer_id)
+                                {
+                                    transfer.acknowledged =
+                                        transfer.acknowledged.max(received.min(transfer.sent));
+                                }
+                            }
                             Ok(ClientMessage::FileTransferError { transfer_id, message }) => {
                                 if agent_file_transfer
                                     .as_ref()
-                                    .is_some_and(|(active_id, _, _, _)| active_id == &transfer_id)
+                                    .is_some_and(|transfer| transfer.transfer_id == transfer_id)
                                 {
                                     agent_file_transfer = None;
                                     let _ = append_diagnostic_log(
@@ -2822,8 +3020,8 @@ async fn run_webrtc_session(
                         }
                         let previous_size = incoming.receiver.received_size;
                         append_partial_file_chunk(&mut incoming.receiver, &chunk)?;
-                        if incoming.receiver.received_size / (5 * 1024 * 1024)
-                            > previous_size / (5 * 1024 * 1024)
+                        if incoming.receiver.received_size / FILE_PROGRESS_LOG_STEP
+                            > previous_size / FILE_PROGRESS_LOG_STEP
                         {
                             let _ = append_diagnostic_log_values(
                                 &state.app,
@@ -2832,8 +3030,10 @@ async fn run_webrtc_session(
                                 Some(incoming.receiver.metadata.expected_size),
                             );
                         }
-                        if incoming.receiver.received_size / (1024 * 1024)
-                            > previous_size / (1024 * 1024)
+                        if incoming.receiver.received_size / FILE_PROGRESS_EVENT_STEP
+                            > previous_size / FILE_PROGRESS_EVENT_STEP
+                            || incoming.receiver.received_size
+                                == incoming.receiver.metadata.expected_size
                         {
                             let _ = state.app.emit(
                                 "agent-file-transfer-progress",
@@ -3143,15 +3343,135 @@ async fn run_webrtc_session(
                     .map_err(|error| format!("发送剪贴板内容失败：{error}"))?;
                 }
             }
+            _ = std::future::ready(()), if agent_file_transfer.as_ref().is_some_and(AgentOutgoingFileTransfer::can_send) => {
+                let Some(transfer) = agent_file_transfer.as_mut() else {
+                    continue;
+                };
+                let chunk = match transfer.read_next_chunk() {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let transfer_id = transfer.transfer_id.clone();
+                        agent_file_transfer = None;
+                        let _ = append_diagnostic_log(&state.app, DiagnosticEvent::FileTransferFailed);
+                        let _ = state.app.emit(
+                            "agent-file-transfer-error",
+                            serde_json::json!({
+                                "transferId": transfer_id,
+                                "message": error,
+                                "local": true,
+                            }),
+                        );
+                        send_signal(socket, serde_json::json!({
+                            "type": "file_transfer_error",
+                            "transfer_id": transfer_id,
+                            "message": error,
+                        }))
+                        .await
+                        .map_err(|error| format!("发送文件传输错误失败：{error}"))?;
+                        continue;
+                    }
+                };
+                let chunk_len = chunk.len() as u64;
+                socket
+                    .send(Message::Binary(chunk.into()))
+                    .await
+                    .map_err(|error| format!("发送文件数据失败：{error}"))?;
+                transfer.sent += chunk_len;
+                let sent = transfer.sent;
+                let size = transfer.size();
+                if sent / FILE_PROGRESS_LOG_STEP > (sent - chunk_len) / FILE_PROGRESS_LOG_STEP {
+                    let _ = append_diagnostic_log_values(
+                        &state.app,
+                        DiagnosticEvent::FileTransferProgress,
+                        Some(sent),
+                        Some(size),
+                    );
+                }
+                if sent - transfer.last_progress_event >= FILE_PROGRESS_EVENT_STEP || sent == size {
+                    transfer.last_progress_event = sent;
+                    let _ = state.app.emit(
+                        "agent-file-transfer-progress",
+                        serde_json::json!({
+                            "transferId": transfer.transfer_id.clone(),
+                            "receivedBytes": sent,
+                        }),
+                    );
+                }
+                if sent == size && !transfer.completion_sent {
+                    transfer.completion_sent = true;
+                    let transfer_id = transfer.transfer_id.clone();
+                    send_signal(socket, serde_json::json!({
+                        "type": "file_complete",
+                        "transfer_id": transfer_id,
+                    }))
+                    .await
+                    .map_err(|error| format!("发送文件完成信号失败：{error}"))?;
+                    let _ = state.app.emit(
+                        "agent-file-transfer-status",
+                        "数据已发送，等待控制端校验并保存。",
+                    );
+                }
+            }
+            finished = async {
+                match agent_file_finish.as_mut() {
+                    Some((_, _, _, task)) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some((transfer_id, file_name, received_size, _)) = agent_file_finish.take() else {
+                    continue;
+                };
+                let saved = finished
+                    .map_err(|error| format!("文件保存任务失败：{error}"))
+                    .and_then(|result| result);
+                let saved_path = match saved {
+                    Ok(path) => path,
+                    Err(error) => {
+                        let _ = append_diagnostic_log(
+                            &state.app,
+                            DiagnosticEvent::FileTransferFailed,
+                        );
+                        send_signal(socket, serde_json::json!({
+                            "type": "file_transfer_error",
+                            "transfer_id": transfer_id,
+                            "message": error,
+                        }))
+                        .await
+                        .map_err(|error| format!("发送文件错误状态失败：{error}"))?;
+                        continue;
+                    }
+                };
+                let _ = append_diagnostic_log(
+                    &state.app,
+                    DiagnosticEvent::FileTransferCompleted,
+                );
+                send_signal(
+                    socket,
+                    serde_json::json!({
+                        "type": "file_transfer_complete",
+                        "transfer_id": transfer_id.clone(),
+                    }),
+                )
+                .await
+                .map_err(|error| format!("发送文件完成状态失败：{error}"))?;
+                state
+                    .app
+                    .emit(
+                        "remote-file-received",
+                        serde_json::json!({
+                            "transferId": transfer_id,
+                            "fileName": file_name,
+                            "savedPath": saved_path,
+                            "controllerName": controller_name,
+                            "receivedBytes": received_size,
+                        }),
+                    )
+                    .map_err(|error| format!("无法显示文件保存状态：{error}"))?;
+            }
             file_command = file_receiver.recv() => {
                 match file_command {
-                    Some(AgentFileCommand::Offer {
-                        transfer_id,
-                        file_name,
-                        size,
-                        sha256,
-                    }) => {
-                        if !is_valid_file_offer(&transfer_id, &file_name, size, &sha256) {
+                    Some(AgentFileCommand::Offer { transfer_id, source }) => {
+                        if !is_valid_file_offer(&transfer_id, &source.file_name, source.size, &source.sha256) {
                             state.app.emit("agent-file-transfer-decision", serde_json::json!({
                                 "transferId": transfer_id,
                                 "accepted": false,
@@ -3159,7 +3479,10 @@ async fn run_webrtc_session(
                             })).map_err(|error| format!("无法报告文件传输状态：{error}"))?;
                             continue;
                         }
-                        if agent_file_transfer.is_some() || agent_incoming_file_transfer.is_some() {
+                        if agent_file_transfer.is_some()
+                            || agent_incoming_file_transfer.is_some()
+                            || agent_file_finish.is_some()
+                        {
                             state.app.emit("agent-file-transfer-decision", serde_json::json!({
                                 "transferId": transfer_id,
                                 "accepted": false,
@@ -3170,71 +3493,19 @@ async fn run_webrtc_session(
                         send_signal(socket, serde_json::json!({
                             "type": "file_offer",
                             "transfer_id": transfer_id,
-                            "file_name": file_name,
-                            "size": size,
-                            "sha256": sha256,
+                            "file_name": source.file_name,
+                            "size": source.size,
+                            "sha256": source.sha256,
+                            "segment_hashes": source.segment_hashes,
                         }))
                         .await
                         .map_err(|error| format!("发送文件请求失败：{error}"))?;
-                        agent_file_transfer = Some((transfer_id, size, 0, false));
-                    }
-                    Some(AgentFileCommand::Chunk {
-                        transfer_id,
-                        bytes,
-                        acknowledged,
-                    }) => {
-                        let next_size = match agent_file_transfer.as_ref() {
-                            Some((active_id, size, sent, true)) if *active_id == transfer_id => {
-                                let next_size = sent.saturating_add(bytes.len() as u64);
-                                if next_size > *size {
-                                    Err("发送的文件数据超过声明大小".to_string())
-                                } else {
-                                    Ok(next_size)
-                                }
-                            }
-                            _ => Err("文件尚未获准传输或请求已过期".to_string()),
-                        };
-                        let next_size = match next_size {
-                            Ok(next_size) => next_size,
-                            Err(error) => {
-                                let _ = acknowledged.send(Err(error.clone()));
-                                let _ = state.app.emit("agent-file-transfer-status", error);
-                                continue;
-                            }
-                        };
-                        if let Err(error) = socket.send(Message::Binary(bytes.into())).await {
-                            let message = format!("发送文件数据失败：{error}");
-                            let _ = acknowledged.send(Err(message.clone()));
-                            return Err(message);
-                        }
-                        if let Some((_, _, sent, _)) = agent_file_transfer.as_mut() {
-                            *sent = next_size;
-                        }
-                        let _ = acknowledged.send(Ok(()));
-                    }
-                    Some(AgentFileCommand::Complete { transfer_id }) => {
-                        match agent_file_transfer.as_ref() {
-                            Some((active_id, size, sent, true))
-                                if active_id == &transfer_id && sent == size =>
-                            {
-                                send_signal(socket, serde_json::json!({
-                                    "type": "file_complete",
-                                    "transfer_id": transfer_id,
-                                }))
-                                .await
-                                .map_err(|error| format!("发送文件完成信号失败：{error}"))?;
-                                let _ = state.app.emit(
-                                    "agent-file-transfer-status",
-                                    format!("已发送文件，等待接收端完成保存。"),
-                                );
-                            }
-                            _ => return Err("文件未完整发送，传输已取消".to_string()),
-                        }
+                        agent_file_transfer = Some(AgentOutgoingFileTransfer::new(transfer_id, source));
                     }
                     Some(AgentFileCommand::Control { transfer_id, action }) => {
                         let is_outgoing = agent_file_transfer
                             .as_ref()
-                            .is_some_and(|(active_id, _, _, _)| active_id == &transfer_id);
+                            .is_some_and(|transfer| transfer.transfer_id == transfer_id);
                         let is_incoming = agent_incoming_file_transfer
                             .as_ref()
                             .is_some_and(|incoming| incoming.receiver.metadata.transfer_id == transfer_id);
@@ -3263,8 +3534,12 @@ async fn run_webrtc_session(
                         }))
                         .await
                         .map_err(|error| format!("发送文件传输控制消息失败：{error}"))?;
-                        if is_outgoing && action == "cancel" {
-                            agent_file_transfer = None;
+                        if is_outgoing {
+                            if action == "cancel" {
+                                agent_file_transfer = None;
+                            } else if let Some(transfer) = agent_file_transfer.as_mut() {
+                                transfer.paused = action == "pause";
+                            }
                         } else if is_incoming {
                             match action.as_str() {
                                 "pause" => file_receive_deadline = None,
@@ -3319,15 +3594,114 @@ fn open_partial_file_receiver(
     file_name: String,
     expected_size: u64,
     sha256: String,
+    segment_hashes: Vec<String>,
 ) -> Result<ControllerFileReceiver, String> {
     let mut directory = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法定位文件续传目录：{error}"))?;
     directory.push("partial-transfers");
-    open_partial_file_receiver_in(&directory, transfer_id, file_name, expected_size, sha256)
+    let mut receiver = open_partial_file_receiver_with_segments_in(
+        &directory,
+        transfer_id,
+        file_name,
+        expected_size,
+        sha256,
+        segment_hashes,
+    )?;
+    let download_dir = app.path().download_dir().ok();
+    if let Err(error) = ensure_receive_disk_space(&receiver, &directory, download_dir.as_deref()) {
+        if receiver.received_size == 0 {
+            let _ = discard_partial_file_receive(&mut receiver);
+        }
+        return Err(error);
+    }
+    Ok(receiver)
 }
 
+/// 接受文件前检查磁盘空间：续传目录需容纳剩余数据；若下载目录在另一块磁盘上
+/// （无法直接改名，需要复制），下载目录还需容纳整个文件。
+fn ensure_receive_disk_space(
+    receiver: &ControllerFileReceiver,
+    partial_dir: &Path,
+    download_dir: Option<&Path>,
+) -> Result<(), String> {
+    let remaining = receiver
+        .metadata
+        .expected_size
+        .saturating_sub(receiver.received_size);
+    ensure_disk_space(partial_dir, remaining.saturating_add(DISK_SPACE_MARGIN), "续传临时目录")?;
+    if let Some(download_dir) = download_dir.filter(|path| path.exists())
+        && !same_volume(partial_dir, download_dir)
+    {
+        ensure_disk_space(
+            download_dir,
+            receiver.metadata.expected_size.saturating_add(DISK_SPACE_MARGIN),
+            "下载目录",
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_disk_space(directory: &Path, required: u64, label: &str) -> Result<(), String> {
+    let available = fs2::available_space(directory)
+        .map_err(|error| format!("无法检查{label}的剩余空间：{error}"))?;
+    if available < required {
+        return Err(format!(
+            "{label}剩余空间不足：需要约 {}，当前可用 {}。请清理磁盘后重试，已接收的进度会保留。",
+            format_bytes(required),
+            format_bytes(available),
+        ));
+    }
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    }
+}
+
+#[cfg(unix)]
+fn same_volume(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(left), fs::metadata(right)) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn same_volume(left: &Path, right: &Path) -> bool {
+    use std::path::Component;
+    let prefix = |path: &Path| match path.components().next() {
+        Some(Component::Prefix(prefix)) => {
+            Some(prefix.as_os_str().to_string_lossy().to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    matches!((prefix(left), prefix(right)), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_volume(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+/// 先写临时文件再改名，避免写记录时崩溃导致续传记录损坏。
+fn write_partial_metadata(path: &Path, metadata: &PartialTransferMetadata) -> Result<(), String> {
+    let contents =
+        serde_json::to_vec(metadata).map_err(|error| format!("无法生成文件续传记录：{error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, contents).map_err(|error| format!("无法保存文件续传记录：{error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("无法保存文件续传记录：{error}"))
+}
+
+#[cfg(test)]
 fn open_partial_file_receiver_in(
     directory: &Path,
     transfer_id: String,
@@ -3335,7 +3709,27 @@ fn open_partial_file_receiver_in(
     expected_size: u64,
     sha256: String,
 ) -> Result<ControllerFileReceiver, String> {
-    if !is_valid_file_offer(&transfer_id, &file_name, expected_size, &sha256) {
+    open_partial_file_receiver_with_segments_in(
+        directory,
+        transfer_id,
+        file_name,
+        expected_size,
+        sha256,
+        Vec::new(),
+    )
+}
+
+fn open_partial_file_receiver_with_segments_in(
+    directory: &Path,
+    transfer_id: String,
+    file_name: String,
+    expected_size: u64,
+    sha256: String,
+    segment_hashes: Vec<String>,
+) -> Result<ControllerFileReceiver, String> {
+    if !is_valid_file_offer(&transfer_id, &file_name, expected_size, &sha256)
+        || !is_valid_segment_hashes(expected_size, &segment_hashes)
+    {
         return Err("文件续传信息无效。".to_string());
     }
     fs::create_dir_all(directory).map_err(|error| format!("无法创建文件续传目录：{error}"))?;
@@ -3345,14 +3739,20 @@ fn open_partial_file_receiver_in(
     let metadata_path = directory.join(format!("{transfer_id}.json"));
     let mut metadata = match fs::read(&metadata_path) {
         Ok(contents) => {
-            let metadata: PartialTransferMetadata = serde_json::from_slice(&contents)
+            let mut metadata: PartialTransferMetadata = serde_json::from_slice(&contents)
                 .map_err(|error| format!("文件续传记录损坏：{error}"))?;
             if metadata.transfer_id != transfer_id
                 || metadata.file_name != file_name
                 || metadata.expected_size != expected_size
                 || metadata.sha256 != sha256
+                || (!metadata.segment_hashes.is_empty()
+                    && !segment_hashes.is_empty()
+                    && metadata.segment_hashes != segment_hashes)
             {
                 return Err("续传文件与现有未完成传输不匹配；请取消旧传输后重试。".to_string());
+            }
+            if metadata.segment_hashes.is_empty() {
+                metadata.segment_hashes = segment_hashes;
             }
             metadata
         }
@@ -3367,36 +3767,40 @@ fn open_partial_file_receiver_in(
                 expected_size,
                 sha256,
                 updated_at: unix_timestamp()?,
+                synced_size: Some(0),
+                segment_hashes,
             };
-            fs::write(
-                &metadata_path,
-                serde_json::to_vec(&metadata)
-                    .map_err(|error| format!("无法生成文件续传记录：{error}"))?,
-            )
-            .map_err(|error| format!("无法保存文件续传记录：{error}"))?;
+            write_partial_metadata(&metadata_path, &metadata)?;
             metadata
         }
         Err(error) => return Err(format!("无法读取文件续传记录：{error}")),
     };
+    let file_size = match fs::metadata(&partial_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(format!("无法检查续传文件：{error}")),
+    };
+    if file_size > expected_size {
+        return Err("续传文件大小超过原文件，已拒绝继续。".to_string());
+    }
+    // 安全回退：只信任最近一次 fsync 检查点之前的数据，丢弃崩溃时可能残留的脏尾巴，
+    // 避免整份文件在最终 SHA-256 校验时失败而被删除。
+    let received_size = match metadata.synced_size {
+        Some(synced) => synced.min(file_size),
+        None => file_size.saturating_sub(LEGACY_RESUME_ROLLBACK),
+    };
+    if received_size < file_size {
+        truncate_partial_file(&partial_path, received_size)?;
+    }
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(&partial_path)
         .map_err(|error| format!("无法打开续传文件：{error}"))?;
-    let received_size = file
-        .metadata()
-        .map_err(|error| format!("无法检查续传文件：{error}"))?
-        .len();
-    if received_size > expected_size {
-        return Err("续传文件大小超过原文件，已拒绝继续。".to_string());
-    }
+    metadata.synced_size = Some(received_size);
     metadata.updated_at = unix_timestamp()?;
-    fs::write(
-        &metadata_path,
-        serde_json::to_vec(&metadata).map_err(|error| format!("无法更新文件续传记录：{error}"))?,
-    )
-    .map_err(|error| format!("无法更新时间文件续传记录：{error}"))?;
+    write_partial_metadata(&metadata_path, &metadata)?;
     Ok(ControllerFileReceiver {
         metadata,
         file: Some(file),
@@ -3425,15 +3829,21 @@ fn append_partial_file_chunk(
         .map_err(|error| format!("写入接收文件失败：{error}"))?;
     receiver.received_size = next_size;
 
+    let synced = receiver.metadata.synced_size.unwrap_or(0);
     let now = unix_timestamp()?;
-    if now.saturating_sub(receiver.metadata.updated_at) >= 60 {
+    if next_size.saturating_sub(synced) >= PARTIAL_SYNC_CHECKPOINT {
+        receiver
+            .file
+            .as_ref()
+            .ok_or_else(|| "文件接收句柄不可用。".to_string())?
+            .sync_data()
+            .map_err(|error| format!("无法将接收数据写入磁盘：{error}"))?;
+        receiver.metadata.synced_size = Some(next_size);
         receiver.metadata.updated_at = now;
-        fs::write(
-            &receiver.metadata_path,
-            serde_json::to_vec(&receiver.metadata)
-                .map_err(|error| format!("无法生成文件续传记录：{error}"))?,
-        )
-        .map_err(|error| format!("无法更新文件续传记录：{error}"))?;
+        write_partial_metadata(&receiver.metadata_path, &receiver.metadata)?;
+    } else if now.saturating_sub(receiver.metadata.updated_at) >= 60 {
+        receiver.metadata.updated_at = now;
+        write_partial_metadata(&receiver.metadata_path, &receiver.metadata)?;
     }
     Ok(())
 }
@@ -3498,31 +3908,57 @@ fn finish_partial_file_receive_in(
         .ok_or_else(|| "文件接收句柄不可用。".to_string())?
         .sync_all()
         .map_err(|error| format!("无法完成接收文件写入：{error}"))?;
-    let actual_hash = hash_file(&receiver.partial_path)?;
-    if actual_hash != receiver.metadata.sha256 {
+    let digest = digest_file_with_progress(&receiver.partial_path, |_| {})?;
+    if digest.sha256 != receiver.metadata.sha256 {
+        if let Some(bad_segment) =
+            first_mismatched_segment(&digest.segment_hashes, &receiver.metadata.segment_hashes)
+        {
+            // 只回退到第一个损坏段的开头，之前完好的数据保留，重新发送同一文件即可从这里续传。
+            let keep = bad_segment as u64 * FILE_SEGMENT_SIZE;
+            receiver.file.take();
+            truncate_partial_file(&receiver.partial_path, keep)?;
+            receiver.received_size = keep;
+            receiver.metadata.synced_size = Some(keep);
+            receiver.metadata.updated_at = unix_timestamp()?;
+            write_partial_metadata(&receiver.metadata_path, &receiver.metadata)?;
+            return Err(format!(
+                "文件第 {} 段（共 {} 段）校验失败，已保留之前完好的 {}；重新发送同一文件即可从该处续传。",
+                bad_segment + 1,
+                receiver.metadata.segment_hashes.len(),
+                format_bytes(keep),
+            ));
+        }
         discard_partial_file_receive(&mut receiver)?;
         return Err("文件校验失败，未保存损坏文件。".to_string());
     }
     receiver.file.take();
-    let (mut destination, destination_path) =
+    let (destination, destination_path) =
         create_received_file_in(directory, &receiver.metadata.file_name)?;
-    let copy_result = (|| {
-        let mut source = File::open(&receiver.partial_path)
-            .map_err(|error| format!("无法打开续传文件：{error}"))?;
-        std::io::copy(&mut source, &mut destination)
-            .map_err(|error| format!("无法保存接收文件：{error}"))?;
-        destination
-            .sync_all()
-            .map_err(|error| format!("无法完成接收文件写入：{error}"))?;
-        Ok::<(), String>(())
-    })();
-    if let Err(error) = copy_result {
-        drop(destination);
-        let _ = fs::remove_file(destination_path);
-        return Err(error);
+    drop(destination);
+    // 同一磁盘上直接改名（瞬间完成，不额外占用空间）；跨磁盘时退回复制。
+    if fs::rename(&receiver.partial_path, &destination_path).is_err() {
+        let copy_result = (|| {
+            let mut source = File::open(&receiver.partial_path)
+                .map_err(|error| format!("无法打开续传文件：{error}"))?;
+            let mut destination = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&destination_path)
+                .map_err(|error| format!("无法打开接收文件：{error}"))?;
+            std::io::copy(&mut source, &mut destination)
+                .map_err(|error| format!("无法保存接收文件：{error}"))?;
+            destination
+                .sync_all()
+                .map_err(|error| format!("无法完成接收文件写入：{error}"))?;
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(&destination_path);
+            return Err(error);
+        }
+        fs::remove_file(&receiver.partial_path)
+            .map_err(|error| format!("文件已保存，但无法清理续传数据：{error}"))?;
     }
-    fs::remove_file(&receiver.partial_path)
-        .map_err(|error| format!("文件已保存，但无法清理续传数据：{error}"))?;
     fs::remove_file(&receiver.metadata_path)
         .map_err(|error| format!("文件已保存，但无法清理续传记录：{error}"))?;
     Ok(destination_path.to_string_lossy().into_owned())
@@ -3531,7 +3967,11 @@ fn finish_partial_file_receive_in(
 fn discard_partial_file_receive(receiver: &mut ControllerFileReceiver) -> Result<(), String> {
     receiver.file.take();
     remove_file_if_present(&receiver.partial_path, "无法清理未完成的接收文件")?;
-    remove_file_if_present(&receiver.metadata_path, "无法清理文件续传记录")
+    remove_file_if_present(&receiver.metadata_path, "无法清理文件续传记录")?;
+    remove_file_if_present(
+        &receiver.metadata_path.with_extension("json.tmp"),
+        "无法清理文件续传临时记录",
+    )
 }
 
 fn remove_file_if_present(path: &Path, message: &str) -> Result<(), String> {
@@ -3542,20 +3982,236 @@ fn remove_file_if_present(path: &Path, message: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn hash_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| format!("无法校验接收文件：{error}"))?;
+    hash_file_with_progress(path, |_| {})
+}
+
+#[cfg(test)]
+fn hash_file_with_progress(path: &Path, progress: impl FnMut(u64)) -> Result<String, String> {
+    digest_file_with_progress(path, progress).map(|digest| digest.sha256)
+}
+
+/// 一次读盘同时算出整文件 SHA-256 和每 64 MiB 分段的 SHA-256，
+/// 内存占用固定为一个缓冲区，与文件大小无关。
+fn digest_file_with_progress(
+    path: &Path,
+    mut progress: impl FnMut(u64),
+) -> Result<FileDigest, String> {
+    let mut file = File::open(path).map_err(|error| format!("无法打开文件进行校验：{error}"))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; MAX_FILE_CHUNK_SIZE];
+    let mut segment_hasher = Sha256::new();
+    let mut segment_filled = 0_u64;
+    let mut segment_hashes = Vec::new();
+    let mut buffer = vec![0_u8; MAX_FILE_CHUNK_SIZE];
+    let mut hashed = 0_u64;
     loop {
         let read = file
             .read(&mut buffer)
-            .map_err(|error| format!("读取接收文件以进行校验失败：{error}"))?;
+            .map_err(|error| format!("读取文件以进行校验失败：{error}"))?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        let mut remaining = &buffer[..read];
+        while !remaining.is_empty() {
+            let take = remaining
+                .len()
+                .min((FILE_SEGMENT_SIZE - segment_filled) as usize);
+            segment_hasher.update(&remaining[..take]);
+            segment_filled += take as u64;
+            remaining = &remaining[take..];
+            if segment_filled == FILE_SEGMENT_SIZE {
+                segment_hashes.push(format!("{:x}", segment_hasher.finalize_reset()));
+                segment_filled = 0;
+            }
+        }
+        let previous = hashed;
+        hashed += read as u64;
+        if hashed / FILE_HASH_PROGRESS_STEP > previous / FILE_HASH_PROGRESS_STEP {
+            progress(hashed);
+        }
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    if segment_filled > 0 {
+        segment_hashes.push(format!("{:x}", segment_hasher.finalize()));
+    }
+    Ok(FileDigest {
+        sha256: format!("{:x}", hasher.finalize()),
+        segment_hashes,
+    })
+}
+
+/// 返回第一个与发送端分段哈希不一致的段号；没有分段信息时返回 None（只能整体重传）。
+fn first_mismatched_segment(actual: &[String], expected: &[String]) -> Option<usize> {
+    if expected.is_empty() || actual.len() != expected.len() {
+        return None;
+    }
+    actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual != expected)
+}
+
+/// 用单独的可写句柄截断（Windows 上以追加方式打开的句柄不能修改文件长度）。
+fn truncate_partial_file(path: &Path, length: u64) -> Result<(), String> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("无法回退续传数据到安全位置：{error}"))?;
+    file.set_len(length)
+        .map_err(|error| format!("无法回退续传数据到安全位置：{error}"))?;
+    file.sync_data()
+        .map_err(|error| format!("无法回退续传数据到安全位置：{error}"))
+}
+
+fn take_prepared_outgoing_file(
+    remote: &RemoteState,
+    source_id: &str,
+) -> Result<Arc<OutgoingFileSource>, String> {
+    let mut files = remote
+        .outgoing_files
+        .lock()
+        .map_err(|_| "文件发送状态不可用".to_string())?;
+    let index = files
+        .iter()
+        .position(|(id, _)| id.as_str() == source_id)
+        .ok_or_else(|| "所选文件已失效，请重新选择。".to_string())?;
+    Ok(files.remove(index).1)
+}
+
+fn prepared_outgoing_file(
+    remote: &RemoteState,
+    source_id: &str,
+) -> Result<Arc<OutgoingFileSource>, String> {
+    remote
+        .outgoing_files
+        .lock()
+        .map_err(|_| "文件发送状态不可用".to_string())?
+        .iter()
+        .find(|(id, _)| id.as_str() == source_id)
+        .map(|(_, source)| Arc::clone(source))
+        .ok_or_else(|| "所选文件已失效，请重新选择。".to_string())
+}
+
+fn prepare_outgoing_file_source(
+    remote: &RemoteState,
+    path: PathBuf,
+    on_progress: &tauri::ipc::Channel<serde_json::Value>,
+) -> Result<OutgoingFileSource, String> {
+    let metadata = fs::metadata(&path).map_err(|error| format!("无法读取所选文件：{error}"))?;
+    if !metadata.is_file() {
+        return Err("只能发送普通文件。".to_string());
+    }
+    let size = metadata.len();
+    if size == 0 || size > MAX_FILE_TRANSFER_SIZE {
+        return Err("文件必须大于 0 且不超过 10 GiB。".to_string());
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| "文件名不是有效的 UTF-8。".to_string())?;
+    if file_name.len() > 255 || file_name.chars().any(|character| character.is_control()) {
+        return Err("文件名过长或包含无效字符。".to_string());
+    }
+    let modified = metadata.modified().ok();
+    let cached = {
+        let mut cache = remote
+            .file_hash_cache
+            .lock()
+            .map_err(|_| "文件校验缓存不可用".to_string())?;
+        match cache.iter().position(|entry| entry.path == path) {
+            Some(index) if cache[index].size == size && cache[index].modified == modified => {
+                // 命中后移到末尾，淘汰时优先移除最久未用的条目。
+                let entry = cache.remove(index);
+                let digest = entry.digest.clone();
+                cache.push(entry);
+                Some(digest)
+            }
+            Some(index) => {
+                cache.remove(index);
+                None
+            }
+            None => None,
+        }
+    };
+    let digest = match cached {
+        Some(digest) => digest,
+        None => {
+            let _ = on_progress.send(serde_json::json!({
+                "fileName": file_name,
+                "hashedBytes": 0,
+                "size": size,
+            }));
+            let digest = digest_file_with_progress(&path, |hashed| {
+                let _ = on_progress.send(serde_json::json!({
+                    "fileName": file_name,
+                    "hashedBytes": hashed,
+                    "size": size,
+                }));
+            })?;
+            let mut cache = remote
+                .file_hash_cache
+                .lock()
+                .map_err(|_| "文件校验缓存不可用".to_string())?;
+            cache.retain(|entry| entry.path != path);
+            if cache.len() >= MAX_FILE_HASH_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push(CachedFileDigest {
+                path: path.clone(),
+                size,
+                modified,
+                digest: digest.clone(),
+            });
+            digest
+        }
+    };
+    let after = fs::metadata(&path).map_err(|error| format!("无法读取所选文件：{error}"))?;
+    if after.len() != size || after.modified().ok() != modified {
+        return Err("文件在校验期间被修改，请稍后重新选择。".to_string());
+    }
+    Ok(OutgoingFileSource {
+        path,
+        file_name,
+        size,
+        modified,
+        sha256: digest.sha256,
+        segment_hashes: digest.segment_hashes,
+    })
+}
+
+fn open_outgoing_file_source(source: &OutgoingFileSource, offset: u64) -> Result<File, String> {
+    if offset > source.size {
+        return Err("续传进度超过文件长度。".to_string());
+    }
+    let mut file =
+        File::open(&source.path).map_err(|error| format!("无法打开要发送的文件：{error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("无法读取要发送的文件：{error}"))?;
+    if metadata.len() != source.size || metadata.modified().ok() != source.modified {
+        return Err("文件在选择后已被修改，请重新选择。".to_string());
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("无法定位文件续传位置：{error}"))?;
+    Ok(file)
+}
+
+fn read_outgoing_chunk(
+    file: &mut File,
+    source: &OutgoingFileSource,
+    offset: u64,
+) -> Result<Vec<u8>, String> {
+    let remaining = source.size.saturating_sub(offset);
+    if remaining == 0 {
+        return Err("文件数据已全部发送。".to_string());
+    }
+    let length = remaining.min(MAX_FILE_CHUNK_SIZE as u64) as usize;
+    let mut buffer = vec![0_u8; length];
+    file.read_exact(&mut buffer)
+        .map_err(|error| format!("读取文件数据失败（文件可能已被修改）：{error}"))?;
+    Ok(buffer)
 }
 
 fn unix_timestamp() -> Result<u64, String> {
@@ -3813,6 +4469,7 @@ fn apply_input(
         | ClientMessage::FileTransferComplete { .. }
         | ClientMessage::FileTransferControl { .. }
         | ClientMessage::FileTransferDecision { .. }
+        | ClientMessage::FileAck { .. }
         | ClientMessage::QualityAdjust { .. } => {}
         ClientMessage::ReleaseAll => {
             for key in state.pressed_keys.drain() {
@@ -4182,8 +4839,9 @@ mod tests {
                 file_name,
                 size: 12,
                 sha256,
+                segment_hashes,
             }) if transfer_id == "transfer-1" && file_name == "notes.txt"
-                && sha256 == hash
+                && sha256 == hash && segment_hashes.is_empty()
         ));
         assert!(matches!(
             serde_json::from_str::<ClientMessage>(
@@ -4215,6 +4873,83 @@ mod tests {
             Ok(ClientMessage::FileTransferControl { transfer_id, action })
                 if transfer_id == "transfer-1" && action == "pause"
         ));
+    }
+
+    #[test]
+    fn file_ack_messages_decode_with_received_offset() {
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"file_ack","transfer_id":"transfer-1","received":1048576}"#
+            ),
+            Ok(ClientMessage::FileAck { transfer_id, received: 1_048_576 })
+                if transfer_id == "transfer-1"
+        ));
+    }
+
+    #[test]
+    fn ten_gibibyte_files_are_within_the_transfer_limit() {
+        let hash = format!("{:x}", Sha256::digest(b"large"));
+        assert!(is_valid_file_offer(
+            "transfer-1",
+            "disk.img",
+            10 * 1024 * 1024 * 1024,
+            &hash,
+        ));
+    }
+
+    #[test]
+    fn outgoing_file_sources_stream_in_bounded_chunks_and_detect_changes() {
+        let directory =
+            std::env::temp_dir().join(format!("lantern-outgoing-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("payload.bin");
+        let contents: Vec<u8> = (0..MAX_FILE_CHUNK_SIZE + 10)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        fs::write(&path, &contents).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let mut progress_calls = 0;
+        let sha256 = hash_file_with_progress(&path, |_| progress_calls += 1).unwrap();
+        assert_eq!(progress_calls, 0);
+        assert_eq!(sha256, format!("{:x}", Sha256::digest(&contents)));
+        let source = Arc::new(OutgoingFileSource {
+            path: path.clone(),
+            file_name: "payload.bin".to_string(),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            sha256,
+            segment_hashes: Vec::new(),
+        });
+
+        let mut transfer = AgentOutgoingFileTransfer::new("transfer-1".to_string(), Arc::clone(&source));
+        assert!(!transfer.can_send());
+        transfer.start(0).unwrap();
+        assert!(transfer.can_send());
+        let first = transfer.read_next_chunk().unwrap();
+        assert_eq!(first.len(), MAX_FILE_CHUNK_SIZE);
+        transfer.sent += first.len() as u64;
+        let second = transfer.read_next_chunk().unwrap();
+        assert_eq!(second, contents[MAX_FILE_CHUNK_SIZE..]);
+        transfer.sent += second.len() as u64;
+        assert!(!transfer.can_send());
+
+        let mut resumed = open_outgoing_file_source(&source, MAX_FILE_CHUNK_SIZE as u64).unwrap();
+        assert_eq!(
+            read_outgoing_chunk(&mut resumed, &source, MAX_FILE_CHUNK_SIZE as u64).unwrap(),
+            contents[MAX_FILE_CHUNK_SIZE..]
+        );
+        assert!(open_outgoing_file_source(&source, source.size + 1).is_err());
+
+        let mut window_limited =
+            AgentOutgoingFileTransfer::new("transfer-2".to_string(), Arc::clone(&source));
+        window_limited.start(0).unwrap();
+        window_limited.sent = FILE_SEND_WINDOW.min(source.size - 1);
+        window_limited.acknowledged = 0;
+        assert_eq!(window_limited.can_send(), window_limited.sent < FILE_SEND_WINDOW);
+
+        fs::write(&path, b"changed").unwrap();
+        assert!(open_outgoing_file_source(&source, 0).is_err());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -4327,6 +5062,162 @@ mod tests {
     }
 
     #[test]
+    fn resumed_transfers_roll_back_to_the_last_synced_checkpoint() {
+        let directory =
+            std::env::temp_dir().join(format!("lantern-transfer-rollback-{}", Uuid::new_v4()));
+        let bytes = vec![7_u8; 32];
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let receiver = open_partial_file_receiver_in(
+            &directory,
+            "transfer-1".to_string(),
+            "rollback.bin".to_string(),
+            bytes.len() as u64,
+            hash.clone(),
+        )
+        .unwrap();
+        let partial_path = receiver.partial_path.clone();
+        let metadata_path = receiver.metadata_path.clone();
+        drop(receiver);
+
+        // 模拟崩溃：磁盘上有 20 字节，但最近检查点只确认了 12 字节。
+        fs::write(&partial_path, &bytes[..20]).unwrap();
+        let mut metadata: PartialTransferMetadata =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata.synced_size = Some(12);
+        write_partial_metadata(&metadata_path, &metadata).unwrap();
+        let receiver = open_partial_file_receiver_in(
+            &directory,
+            "transfer-1".to_string(),
+            "rollback.bin".to_string(),
+            bytes.len() as u64,
+            hash.clone(),
+        )
+        .unwrap();
+        assert_eq!(receiver.received_size, 12);
+        assert_eq!(fs::metadata(&partial_path).unwrap().len(), 12);
+        drop(receiver);
+
+        // 旧版记录没有检查点：保守回退 LEGACY_RESUME_ROLLBACK（小文件即回退到 0）。
+        fs::write(&partial_path, &bytes[..20]).unwrap();
+        let mut metadata: PartialTransferMetadata =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata.synced_size = None;
+        write_partial_metadata(&metadata_path, &metadata).unwrap();
+        let mut receiver = open_partial_file_receiver_in(
+            &directory,
+            "transfer-1".to_string(),
+            "rollback.bin".to_string(),
+            bytes.len() as u64,
+            hash,
+        )
+        .unwrap();
+        assert_eq!(receiver.received_size, 0);
+        discard_partial_file_receive(&mut receiver).unwrap();
+        assert!(!partial_path.exists());
+        assert!(!metadata_path.exists());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn segment_hash_lists_are_validated_against_file_size() {
+        let hash = "a".repeat(64);
+        assert!(is_valid_segment_hashes(10, &[]));
+        assert!(is_valid_segment_hashes(10, &[hash.clone()]));
+        assert!(is_valid_segment_hashes(FILE_SEGMENT_SIZE, &[hash.clone()]));
+        assert!(!is_valid_segment_hashes(FILE_SEGMENT_SIZE + 1, &[hash.clone()]));
+        assert!(is_valid_segment_hashes(
+            FILE_SEGMENT_SIZE + 1,
+            &[hash.clone(), hash.clone()]
+        ));
+        assert!(!is_valid_segment_hashes(10, &["xyz".to_string()]));
+        assert_eq!(
+            first_mismatched_segment(
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                &["a".to_string(), "x".to_string(), "c".to_string()],
+            ),
+            Some(1)
+        );
+        assert_eq!(first_mismatched_segment(&["a".to_string()], &[]), None);
+        assert_eq!(
+            first_mismatched_segment(&["a".to_string()], &["a".to_string(), "b".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn corrupt_segment_rolls_back_to_the_segment_start_instead_of_discarding() {
+        let root =
+            std::env::temp_dir().join(format!("lantern-transfer-segment-{}", Uuid::new_v4()));
+        let partial_dir = root.join("partial");
+        let downloads_dir = root.join("downloads");
+        fs::create_dir_all(&root).unwrap();
+        let contents: Vec<u8> = (0..FILE_SEGMENT_SIZE as usize + 10)
+            .map(|index| (index % 253) as u8)
+            .collect();
+        let source_path = root.join("source.bin");
+        fs::write(&source_path, &contents).unwrap();
+        let digest = digest_file_with_progress(&source_path, |_| {}).unwrap();
+        assert_eq!(digest.sha256, format!("{:x}", Sha256::digest(&contents)));
+        assert_eq!(digest.segment_hashes.len(), 2);
+        assert_eq!(
+            digest.segment_hashes[1],
+            format!("{:x}", Sha256::digest(&contents[FILE_SEGMENT_SIZE as usize..]))
+        );
+
+        let mut receiver = open_partial_file_receiver_with_segments_in(
+            &partial_dir,
+            "transfer-1".to_string(),
+            "segmented.bin".to_string(),
+            contents.len() as u64,
+            digest.sha256.clone(),
+            digest.segment_hashes.clone(),
+        )
+        .unwrap();
+        let mut corrupted = contents.clone();
+        *corrupted.last_mut().unwrap() ^= 0xff;
+        receiver.file.as_mut().unwrap().write_all(&corrupted).unwrap();
+        receiver.received_size = corrupted.len() as u64;
+        let partial_path = receiver.partial_path.clone();
+        let error = finish_partial_file_receive_in(receiver, &downloads_dir).unwrap_err();
+        assert!(error.contains("第 2 段"));
+        assert_eq!(fs::metadata(&partial_path).unwrap().len(), FILE_SEGMENT_SIZE);
+        assert!(!downloads_dir.join("segmented.bin").exists());
+
+        let receiver = open_partial_file_receiver_with_segments_in(
+            &partial_dir,
+            "transfer-1".to_string(),
+            "segmented.bin".to_string(),
+            contents.len() as u64,
+            digest.sha256,
+            digest.segment_hashes,
+        )
+        .unwrap();
+        assert_eq!(receiver.received_size, FILE_SEGMENT_SIZE);
+        drop(receiver);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receiving_requires_enough_free_disk_space() {
+        let directory =
+            std::env::temp_dir().join(format!("lantern-transfer-space-{}", Uuid::new_v4()));
+        let hash = format!("{:x}", Sha256::digest(b"space"));
+        let mut receiver = open_partial_file_receiver_in(
+            &directory,
+            "transfer-1".to_string(),
+            "space.bin".to_string(),
+            1024,
+            hash,
+        )
+        .unwrap();
+        assert!(ensure_receive_disk_space(&receiver, &directory, None).is_ok());
+        assert!(ensure_disk_space(&directory, u64::MAX, "测试目录").is_err());
+        assert!(same_volume(&directory, &directory));
+        discard_partial_file_receive(&mut receiver).unwrap();
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn expired_partial_transfers_are_removed() {
         let directory =
             std::env::temp_dir().join(format!("lantern-transfer-expiry-{}", Uuid::new_v4()));
@@ -4342,6 +5233,8 @@ mod tests {
                 expected_size: 8,
                 sha256: format!("{:x}", Sha256::digest(b"old data")),
                 updated_at: 0,
+                synced_size: None,
+                segment_hashes: Vec::new(),
             })
             .unwrap(),
         )
